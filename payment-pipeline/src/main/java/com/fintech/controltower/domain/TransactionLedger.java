@@ -12,6 +12,7 @@ public class TransactionLedger {
     public enum TransactionStatus {
         ACCEPTED,
         PROCESSING,
+        NETWORK_PENDING,
         SETTLED,
         REJECTED,
         SUSPENDED_AML_HOLD
@@ -26,6 +27,10 @@ public class TransactionLedger {
     private String debtorName;
     private String debtorAccountNumber;
     private String debtorBic;
+
+    @Column(name = "debtor_country_code", length = 2)
+    private String debtorCountryCode;
+
     private String debtorClearingSystemCode;
     private String debtorClearingMemberId;
 
@@ -33,6 +38,10 @@ public class TransactionLedger {
     private String creditorName;
     private String creditorAccountNumber;
     private String creditorBic;
+
+    @Column(name = "creditor_country_code", length = 2)
+    private String creditorCountryCode;
+
     private String creditorClearingSystemCode;
     private String creditorClearingMemberId;
 
@@ -85,6 +94,9 @@ public class TransactionLedger {
     public String getDebtorBic() { return debtorBic; }
     public void setDebtorBic(String debtorBic) { this.debtorBic = debtorBic; }
 
+    public String getDebtorCountryCode() { return debtorCountryCode; }
+    public void setDebtorCountryCode(String debtorCountryCode) { this.debtorCountryCode = debtorCountryCode; }
+
     public String getDebtorClearingSystemCode() { return debtorClearingSystemCode; }
     public void setDebtorClearingSystemCode(String debtorClearingSystemCode) { this.debtorClearingSystemCode = debtorClearingSystemCode; }
 
@@ -99,6 +111,9 @@ public class TransactionLedger {
 
     public String getCreditorBic() { return creditorBic; }
     public void setCreditorBic(String creditorBic) { this.creditorBic = creditorBic; }
+
+    public String getCreditorCountryCode() { return creditorCountryCode; }
+    public void setCreditorCountryCode(String creditorCountryCode) { this.creditorCountryCode = creditorCountryCode; }
 
     public String getCreditorClearingSystemCode() { return creditorClearingSystemCode; }
     public void setCreditorClearingSystemCode(String creditorClearingSystemCode) { this.creditorClearingSystemCode = creditorClearingSystemCode; }

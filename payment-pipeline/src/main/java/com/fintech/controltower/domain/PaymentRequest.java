@@ -10,6 +10,7 @@ public record PaymentRequest(
         String debtorName,
         String debtorAccountNumber,
         String debtorBic,
+        String debtorCountryCode,
         String debtorClearingSystemCode,
         String debtorClearingMemberId,
 
@@ -17,6 +18,7 @@ public record PaymentRequest(
         String creditorName,
         String creditorAccountNumber,
         String creditorBic,
+        String creditorCountryCode,
         String creditorClearingSystemCode,
         String creditorClearingMemberId,
 

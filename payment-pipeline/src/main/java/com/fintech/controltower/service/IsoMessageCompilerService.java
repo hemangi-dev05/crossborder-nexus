@@ -29,8 +29,9 @@ public class IsoMessageCompilerService {
             "[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}"
     );
 
+    // Matches the BIC format defined in the pacs.008 XSD.
     private static final Pattern BIC_PATTERN = Pattern.compile(
-            "[A-Z0-9]{8}([A-Z0-9]{3})?"
+            "[A-Z0-9]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?"
     );
 
     private final IsoMessageValidatorService isoMessageValidatorService;
@@ -377,7 +378,7 @@ public class IsoMessageCompilerService {
         ).matches()) {
 
             throw new IllegalArgumentException(
-                    party + " BIC must contain 8 or 11 alphanumeric characters"
+                    party + " BIC must contain a valid 8 or 11 character format"
             );
         }
 

@@ -3,14 +3,26 @@ package com.fintech.controltower.service;
 
 import com.fintech.controltower.api.dto.PaymentDetailsResponse;
 import com.fintech.controltower.api.dto.PaymentPageResponse;
+import com.fintech.controltower.api.dto.PaymentHistoryResponse;
+import com.fintech.controltower.api.dto.IsoMessageResponse;
+import com.fintech.controltower.api.dto.NetworkSubmissionResponse;
+import com.fintech.controltower.api.dto.PaymentTrackingResponse;
+
 import com.fintech.controltower.domain.TransactionLedger;
 import com.fintech.controltower.domain.TransactionLedgerRepository;
+import com.fintech.controltower.domain.PaymentStatusHistory;
+import com.fintech.controltower.domain.PaymentStatusHistoryRepository;
+import com.fintech.controltower.domain.IsoMessage;
+import com.fintech.controltower.domain.IsoMessageRepository;
+import com.fintech.controltower.domain.NetworkSubmission;
+import com.fintech.controltower.domain.NetworkSubmissionRepository;
 
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
@@ -18,9 +30,20 @@ import java.util.List;
 public class PaymentTrackingService {
 
     private final TransactionLedgerRepository ledgerRepository;
+    private final PaymentStatusHistoryRepository historyRepository;
+    private final IsoMessageRepository isoMessageRepository;
+    private final NetworkSubmissionRepository networkSubmissionRepository;
 
-    public PaymentTrackingService(TransactionLedgerRepository ledgerRepository) {
+    public PaymentTrackingService(
+            TransactionLedgerRepository ledgerRepository,
+            PaymentStatusHistoryRepository historyRepository,
+            IsoMessageRepository isoMessageRepository,
+            NetworkSubmissionRepository networkSubmissionRepository) {
+
         this.ledgerRepository = ledgerRepository;
+        this.historyRepository = historyRepository;
+        this.isoMessageRepository = isoMessageRepository;
+        this.networkSubmissionRepository = networkSubmissionRepository;
     }
 
     // Retrieve one payment using UETR
@@ -32,6 +55,95 @@ public class PaymentTrackingService {
                 ));
 
         return mapToResponse(payment);
+    }
+
+    // Retrieve complete payment status history using UETR
+    public List<PaymentHistoryResponse> getPaymentHistory(String uetr) {
+
+        if (uetr == null || uetr.isBlank()) {
+            throw new IllegalArgumentException("UETR cannot be empty.");
+        }
+
+        ledgerRepository.findById(uetr)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "Payment not found for UETR: " + uetr
+                ));
+
+        List<PaymentStatusHistory> history =
+                historyRepository.findByUetrOrderByChangedAtAsc(uetr);
+
+        return history.stream()
+                .map(PaymentHistoryResponse::from)
+                .toList();
+    }
+
+    // Retrieve persisted ISO messages using UETR
+    @Transactional(readOnly = true)
+    public List<IsoMessageResponse> getIsoMessages(String uetr) {
+
+        if (uetr == null || uetr.isBlank()) {
+            throw new IllegalArgumentException("UETR cannot be empty.");
+        }
+
+        ledgerRepository.findById(uetr)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "Payment not found for UETR: " + uetr
+                ));
+
+        List<IsoMessage> messages =
+                isoMessageRepository
+                        .findByTransactionLedger_UetrOrderByCreatedAtAsc(uetr);
+
+        return messages.stream()
+                .map(this::mapToIsoMessageResponse)
+                .toList();
+    }
+
+    // Retrieve complete payment tracking information using UETR
+    @Transactional(readOnly = true)
+    public PaymentTrackingResponse getPaymentTracking(String uetr) {
+
+        if (uetr == null || uetr.isBlank()) {
+            throw new IllegalArgumentException("UETR cannot be empty.");
+        }
+
+        // 1. Retrieve the payment
+        TransactionLedger payment = ledgerRepository.findById(uetr)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "Payment not found for UETR: " + uetr
+                ));
+
+        // 2. Retrieve network submission evidence
+        List<NetworkSubmissionResponse> networkSubmissions =
+                networkSubmissionRepository
+                        .findByTransactionLedger_UetrOrderBySubmittedAtAsc(uetr)
+                        .stream()
+                        .map(submission ->
+                                NetworkSubmissionResponse.from(submission, uetr))
+                        .toList();
+
+        // 3. Retrieve ISO 20022 messages
+        List<IsoMessageResponse> isoMessages =
+                isoMessageRepository
+                        .findByTransactionLedger_UetrOrderByCreatedAtAsc(uetr)
+                        .stream()
+                        .map(this::mapToIsoMessageResponse)
+                        .toList();
+
+        // 4. Retrieve complete status history
+        List<PaymentHistoryResponse> statusHistory =
+                historyRepository.findByUetrOrderByChangedAtAsc(uetr)
+                        .stream()
+                        .map(PaymentHistoryResponse::from)
+                        .toList();
+
+        // Combine all information into one response
+        return new PaymentTrackingResponse(
+                mapToResponse(payment),
+                networkSubmissions,
+                isoMessages,
+                statusHistory
+        );
     }
 
     // Retrieve all payments or filter by status
@@ -127,6 +239,21 @@ public class PaymentTrackingService {
                 payment.getStatus(),
                 payment.getCreatedAt(),
                 payment.getUpdatedAt()
+        );
+    }
+
+    // Convert ISO message entity into response DTO
+    private IsoMessageResponse mapToIsoMessageResponse(
+            IsoMessage message) {
+
+        return new IsoMessageResponse(
+                message.getId(),
+                message.getTransactionLedger().getUetr(),
+                message.getMessageType(),
+                message.getSchemaVersion(),
+                message.getValidationStatus(),
+                message.getCreatedAt(),
+                message.getMessageContent()
         );
     }
 }

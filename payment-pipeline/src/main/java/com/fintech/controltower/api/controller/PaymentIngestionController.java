@@ -1,11 +1,14 @@
 
 package com.fintech.controltower.api.controller;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fintech.controltower.domain.PaymentRequest;
-import com.fintech.controltower.service.PaymentSagaOrchestrator;
+import com.fintech.controltower.domain.IdempotencyRecord;
+import com.fintech.controltower.exception.IdempotencyConflictException;
+import com.fintech.controltower.service.PaymentIdempotencyService;
+import com.fintech.controltower.service.PaymentIdempotencyService.PaymentResult;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -14,6 +17,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -22,10 +26,16 @@ import java.util.regex.Pattern;
 
 @RestController
 @RequestMapping("/api/v1/payments")
-@CrossOrigin(origins = {
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-})
+@CrossOrigin(
+        origins = {
+                "http://localhost:3000",
+                "http://127.0.0.1:3000"
+        },
+        allowedHeaders = {
+                "Content-Type",
+                "Idempotency-Key"
+        }
+)
 public class PaymentIngestionController {
 
     private static final Logger log =
@@ -34,14 +44,14 @@ public class PaymentIngestionController {
     private static final Pattern CURRENCY_PATTERN =
             Pattern.compile("[A-Za-z]{3}");
 
-    private final PaymentSagaOrchestrator paymentSagaOrchestrator;
+    private final PaymentIdempotencyService paymentIdempotencyService;
     private final ObjectMapper objectMapper;
 
     public PaymentIngestionController(
-            PaymentSagaOrchestrator paymentSagaOrchestrator,
+            PaymentIdempotencyService paymentIdempotencyService,
             ObjectMapper objectMapper
     ) {
-        this.paymentSagaOrchestrator = paymentSagaOrchestrator;
+        this.paymentIdempotencyService = paymentIdempotencyService;
         this.objectMapper = objectMapper;
     }
 
@@ -51,6 +61,7 @@ public class PaymentIngestionController {
             produces = MediaType.APPLICATION_JSON_VALUE
     )
     public ResponseEntity<String> initiatePayment(
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
             @RequestBody PaymentRequest request
     ) {
 
@@ -67,29 +78,43 @@ public class PaymentIngestionController {
         }
 
         try {
-            String uetr =
-                    paymentSagaOrchestrator.executePaymentSaga(request);
 
-            String sagaOutcome = jsonResponseString(
-                    "ACCEPTED",
-                    "Payment accepted for simulated processing. UETR: " + uetr
-            );
+            PaymentResult result =
+                    paymentIdempotencyService.processPayment(
+                            idempotencyKey,
+                            request
+                    );
 
-            return ResponseEntity
-                    .status(resolveHttpStatus(sagaOutcome))
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .body(sagaOutcome);
+            HttpStatus httpStatus = switch (result.state()) {
 
-        } catch (SecurityException e) {
+                case ACCEPTED -> result.replayed()
+                        ? HttpStatus.OK
+                        : HttpStatus.ACCEPTED;
 
-            log.warn(
-                    "Payment blocked by compliance policy: {}",
-                    e.getMessage()
-            );
+                case NETWORK_PENDING -> HttpStatus.ACCEPTED;
+
+                case AML_HOLD -> HttpStatus.FORBIDDEN;
+
+                case REJECTED -> HttpStatus.UNPROCESSABLE_ENTITY;
+
+                case IN_PROGRESS -> HttpStatus.CONFLICT;
+
+                case FAILED -> HttpStatus.INTERNAL_SERVER_ERROR;
+            };
 
             return jsonResponse(
-                    HttpStatus.FORBIDDEN,
-                    "SUSPENDED_AML_HOLD",
+                    httpStatus,
+                    result.state().name(),
+                    result.message()
+            );
+
+        } catch (IdempotencyConflictException e) {
+
+            log.warn("Idempotency conflict: {}", e.getMessage());
+
+            return jsonResponse(
+                    HttpStatus.CONFLICT,
+                    "CONFLICT",
                     e.getMessage()
             );
 
@@ -143,27 +168,6 @@ public class PaymentIngestionController {
         }
 
         return null;
-    }
-
-    private HttpStatus resolveHttpStatus(String sagaOutcomeJson) {
-
-        try {
-            JsonNode status =
-                    objectMapper.readTree(sagaOutcomeJson).path("status");
-
-            return switch (status.asText("")) {
-                case "ACCEPTED" -> HttpStatus.ACCEPTED;
-                case "SUSPENDED_AML_HOLD" -> HttpStatus.FORBIDDEN;
-                case "REJECTED" -> HttpStatus.BAD_REQUEST;
-                default -> HttpStatus.INTERNAL_SERVER_ERROR;
-            };
-
-        } catch (Exception e) {
-
-            log.error("Unable to parse saga outcome payload", e);
-
-            return HttpStatus.INTERNAL_SERVER_ERROR;
-        }
     }
 
     private String jsonResponseString(

@@ -1,105 +1,241 @@
 
 package com.fintech.controltower.service;
 
+import com.fintech.controltower.domain.IsoMessage;
+import com.fintech.controltower.domain.IsoMessageRepository;
+import com.fintech.controltower.domain.NetworkSubmission;
+import com.fintech.controltower.domain.NetworkSubmissionRepository;
 import com.fintech.controltower.domain.PaymentRequest;
+import com.fintech.controltower.domain.PaymentStatusHistory;
+import com.fintech.controltower.domain.PaymentStatusHistoryRepository;
 import com.fintech.controltower.domain.TransactionLedger;
 import com.fintech.controltower.domain.TransactionLedgerRepository;
-import com.fintech.controltower.domain.AmlScreeningService;
+import com.fintech.controltower.exception.AmlHoldException;
+import com.fintech.controltower.service.network.NetworkAdapterRegistry;
+import com.fintech.controltower.service.network.NetworkSubmissionResult;
+import com.fintech.controltower.service.network.PaymentNetworkAdapter;
 
 import org.springframework.stereotype.Service;
-
-import java.math.BigDecimal;
-import java.util.UUID;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class PaymentSagaOrchestrator {
 
     private final TransactionLedgerRepository ledgerRepository;
+    private final PaymentStatusHistoryRepository historyRepository;
+    private final IsoMessageRepository isoMessageRepository;
+    private final NetworkSubmissionRepository networkSubmissionRepository;
     private final AmlScreeningService amlScreeningService;
-    private final IsoMessageCompilerService isoCompilerService;
-
-    private static final BigDecimal ROUTING_THRESHOLD =
-            new BigDecimal("10000.00");
+    private final PaymentRoutingService paymentRoutingService;
+    private final NetworkAdapterRegistry networkAdapterRegistry;
+    private final TransactionStatusService transactionStatusService;
 
     public PaymentSagaOrchestrator(
             TransactionLedgerRepository ledgerRepository,
+            PaymentStatusHistoryRepository historyRepository,
+            IsoMessageRepository isoMessageRepository,
+            NetworkSubmissionRepository networkSubmissionRepository,
             AmlScreeningService amlScreeningService,
-            IsoMessageCompilerService isoCompilerService) {
-
+            PaymentRoutingService paymentRoutingService,
+            NetworkAdapterRegistry networkAdapterRegistry,
+            TransactionStatusService transactionStatusService
+    ) {
         this.ledgerRepository = ledgerRepository;
+        this.historyRepository = historyRepository;
+        this.isoMessageRepository = isoMessageRepository;
+        this.networkSubmissionRepository = networkSubmissionRepository;
         this.amlScreeningService = amlScreeningService;
-        this.isoCompilerService = isoCompilerService;
+        this.paymentRoutingService = paymentRoutingService;
+        this.networkAdapterRegistry = networkAdapterRegistry;
+        this.transactionStatusService = transactionStatusService;
     }
 
-    public String executePaymentSaga(PaymentRequest request) {
+    @Transactional(noRollbackFor = SecurityException.class)
+    public String executePaymentSaga(
+            PaymentRequest request,
+            String uetr
+    ) {
 
-        // 1. Generate unique transaction reference
-        String uetr = UUID.randomUUID().toString();
-
-        // 2. Initialize transaction ledger record
+        // 1. Initialize the transaction ledger.
         TransactionLedger ledger = new TransactionLedger();
 
         ledger.setUetr(uetr);
         ledger.setTransactionId(request.transactionId());
 
-        // Sender details
+        // 2. Map sender details.
         ledger.setDebtorName(request.debtorName());
         ledger.setDebtorAccountNumber(request.debtorAccountNumber());
         ledger.setDebtorBic(request.debtorBic());
-        ledger.setDebtorClearingSystemCode(request.debtorClearingSystemCode());
-        ledger.setDebtorClearingMemberId(request.debtorClearingMemberId());
+        ledger.setDebtorCountryCode(request.debtorCountryCode());
+        ledger.setDebtorClearingSystemCode(
+                request.debtorClearingSystemCode()
+        );
+        ledger.setDebtorClearingMemberId(
+                request.debtorClearingMemberId()
+        );
 
-        // Beneficiary details
+        // 3. Map beneficiary details.
         ledger.setCreditorName(request.creditorName());
         ledger.setCreditorAccountNumber(request.creditorAccountNumber());
         ledger.setCreditorBic(request.creditorBic());
-        ledger.setCreditorClearingSystemCode(request.creditorClearingSystemCode());
-        ledger.setCreditorClearingMemberId(request.creditorClearingMemberId());
+        ledger.setCreditorCountryCode(request.creditorCountryCode());
+        ledger.setCreditorClearingSystemCode(
+                request.creditorClearingSystemCode()
+        );
+        ledger.setCreditorClearingMemberId(
+                request.creditorClearingMemberId()
+        );
 
-        // Payment details
+        // 4. Map payment details.
         ledger.setAmount(request.amount());
         ledger.setCurrency(request.currency());
 
-        // Initial lifecycle status
-        ledger.setStatus(TransactionLedger.TransactionStatus.ACCEPTED);
-
-        // 3. Perform AML screening
+        // 5. Perform AML screening.
         AmlScreeningService.AmlScreeningResult screeningResult =
                 amlScreeningService.screenTransaction(request);
 
         if (screeningResult.hold()) {
-            throw new SecurityException(
-                    "Transaction blocked by AML compliance policy for UETR: "
-                            + uetr + ". Reason: " + screeningResult.reason()
+
+            ledger.setStatus(
+                    TransactionLedger.TransactionStatus.SUSPENDED_AML_HOLD
+            );
+
+            ledgerRepository.save(ledger);
+
+            PaymentStatusHistory history = new PaymentStatusHistory(
+                    uetr,
+                    null,
+                    TransactionLedger.TransactionStatus.SUSPENDED_AML_HOLD,
+                    screeningResult.reason()
+            );
+
+            historyRepository.save(history);
+
+            throw new AmlHoldException(
+                    uetr,
+                    screeningResult.reason()
             );
         }
 
-        // 4. Evaluate payment routing
-        if (request.amount().compareTo(ROUTING_THRESHOLD) >= 0
-                || !"INR".equalsIgnoreCase(request.currency())) {
+        // 6. Determine the configured payment route.
+        String routeType = paymentRoutingService.determineRoute(
+                request.debtorCountryCode(),
+                request.creditorCountryCode(),
+                request.currency()
+        );
 
-            // Cross-border or high-value payment: generate ISO 20022 pacs.008
-            String isoXmlMessage =
-                    isoCompilerService.compilePacs008(request, uetr);
+        // 7. Mark the payment as accepted by our platform.
+        ledger.setStatus(
+                TransactionLedger.TransactionStatus.ACCEPTED
+        );
 
-            System.out.println(
-                    "Generated ISO 20022 pacs.008 message. UETR: " + uetr
-            );
-
-        } else {
-
-            // Domestic payment simulation
-            System.out.println(
-                    "Selected domestic payment processing route. UETR: " + uetr
-            );
-        }
-
-        // 5. Persist transaction record
         ledgerRepository.save(ledger);
 
+        PaymentStatusHistory initialHistory = new PaymentStatusHistory(
+                uetr,
+                null,
+                TransactionLedger.TransactionStatus.ACCEPTED,
+                "Payment accepted after successful AML screening"
+        );
+
+        historyRepository.save(initialHistory);
+
+        // 8. Find the adapter responsible for this route.
+        PaymentNetworkAdapter adapter =
+                networkAdapterRegistry.getAdapter(routeType);
+
+        // 9. Submit the payment instruction to the simulated network.
+        NetworkSubmissionResult submissionResult =
+                adapter.submit(request, uetr);
+
+        if (submissionResult == null) {
+            throw new IllegalStateException(
+                    "Network adapter returned no submission result."
+            );
+        }
+
+        if (!routeType.equals(submissionResult.routeType())) {
+            throw new IllegalStateException(
+                    "Network adapter returned an unexpected route type."
+            );
+        }
+
+        if (submissionResult.status() == null) {
+            throw new IllegalStateException(
+                    "Network adapter returned no submission status."
+            );
+        }
+
+        // 10. Persist the network submission evidence.
+        NetworkSubmission networkSubmission = new NetworkSubmission(
+                ledger,
+                submissionResult.routeType(),
+                submissionResult.networkReference(),
+                NetworkSubmission.SubmissionStatus.valueOf(
+                        submissionResult.status().name()
+                ),
+                submissionResult.submittedAt(),
+                submissionResult.respondedAt(),
+                submissionResult.responseMessage()
+        );
+
+        networkSubmissionRepository.save(networkSubmission);
+
+        // 11. Handle the simulated acknowledgement.
+        if (submissionResult.status()
+                != NetworkSubmissionResult.SubmissionStatus.SIMULATED_ACKNOWLEDGED) {
+
+            throw new IllegalStateException(
+                    "Simulated network did not acknowledge the payment. "
+                            + "Status: " + submissionResult.status()
+                            + ". Response: " + submissionResult.responseMessage()
+            );
+        }
+
+        // 12. Persist the ISO message when the adapter generated one.
+        String isoXmlMessage = submissionResult.isoXmlMessage();
+
+        if (isoXmlMessage != null && !isoXmlMessage.isBlank()) {
+
+            IsoMessage isoMessage = new IsoMessage();
+
+            isoMessage.setTransactionLedger(ledger);
+            isoMessage.setMessageType("pacs.008");
+            isoMessage.setSchemaVersion("001.14");
+            isoMessage.setMessageContent(isoXmlMessage);
+            isoMessage.setValidationStatus("VALIDATED");
+
+            isoMessageRepository.save(isoMessage);
+        }
+
+        // Cross-border submissions must contain their generated ISO message.
+        if ("CROSS_BORDER_CORRESPONDENT".equals(routeType)
+                && (isoXmlMessage == null || isoXmlMessage.isBlank())) {
+
+            throw new IllegalStateException(
+                    "Cross-border adapter did not return an ISO 20022 message."
+            );
+        }
+
+        // 13. Move the payment to PROCESSING after simulated network ACK.
+        transactionStatusService.updateStatus(
+                uetr,
+                TransactionLedger.TransactionStatus.PROCESSING,
+                "Simulated network acknowledged the payment instruction. "
+                        + "Network reference: "
+                        + submissionResult.networkReference()
+        );
+
         System.out.println(
-                "Payment ledger saved successfully. Status: "
-                        + ledger.getStatus() + ", UETR: " + uetr
+                "Simulated network submission acknowledged. "
+                        + "Route: " + routeType
+                        + ", Reference: " + submissionResult.networkReference()
+                        + ", UETR: " + uetr
+        );
+
+        System.out.println(
+                "Payment is now PROCESSING. Settlement has not been confirmed. "
+                        + "UETR: " + uetr
         );
 
         return uetr;
