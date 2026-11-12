@@ -118,9 +118,11 @@ public class PaymentIdempotencyService {
         }
 
         // 4. Execute the payment saga.
+        PaymentSagaResult sagaResult;
+
         try {
 
-            paymentSagaOrchestrator.executePaymentSaga(
+            sagaResult = paymentSagaOrchestrator.executePaymentSaga(
                     request,
                     uetr
             );
@@ -151,8 +153,7 @@ public class PaymentIdempotencyService {
             String message = exception.getMessage();
 
             log.warn(
-                    "Payment rejected because the corridor is unsupported. "
-                            + "UETR: {}",
+                    "Payment rejected because the corridor is unsupported. UETR: {}",
                     uetr
             );
 
@@ -195,19 +196,32 @@ public class PaymentIdempotencyService {
             );
         }
 
-        // 5. Complete the idempotency record after successful saga execution.
-        String message =
-                "Payment accepted for simulated processing. UETR: " + uetr;
+        // 5. Map the saga outcome to the idempotency state.
+        IdempotencyRecord.ProcessingState finalState =
+                switch (sagaResult.outcome()) {
+
+                    case ACKNOWLEDGED ->
+                            IdempotencyRecord.ProcessingState.ACCEPTED;
+
+                    case REJECTED ->
+                            IdempotencyRecord.ProcessingState.REJECTED;
+
+                    case NETWORK_PENDING ->
+                            IdempotencyRecord.ProcessingState.NETWORK_PENDING;
+                };
+
+        // 6. Persist the outcome for future idempotent replays.
+        String message = sagaResult.message();
 
         recordService.complete(
                 idempotencyKey,
-                IdempotencyRecord.ProcessingState.ACCEPTED,
+                finalState,
                 uetr,
                 message
         );
 
         return new PaymentResult(
-                IdempotencyRecord.ProcessingState.ACCEPTED,
+                finalState,
                 uetr,
                 message,
                 false

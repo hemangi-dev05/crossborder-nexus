@@ -4,6 +4,7 @@ package com.fintech.controltower.service.network;
 import com.fintech.controltower.domain.PaymentRequest;
 import com.fintech.controltower.service.IsoMessageCompilerService;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -14,10 +15,15 @@ public class CrossBorderAdapter implements PaymentNetworkAdapter {
 
     private final IsoMessageCompilerService isoCompilerService;
 
+    private final NetworkSubmissionResult.SubmissionStatus simulatedOutcome;
+
     public CrossBorderAdapter(
-            IsoMessageCompilerService isoCompilerService
+            IsoMessageCompilerService isoCompilerService,
+            @Value("${payment-network.simulation.cross-border-outcome:SIMULATED_ACKNOWLEDGED}")
+            NetworkSubmissionResult.SubmissionStatus simulatedOutcome
     ) {
         this.isoCompilerService = isoCompilerService;
+        this.simulatedOutcome = simulatedOutcome;
     }
 
     @Override
@@ -46,16 +52,29 @@ public class CrossBorderAdapter implements PaymentNetworkAdapter {
         String networkReference =
                 "SIM-CB-" + UUID.randomUUID();
 
-        // Simulate a successful correspondent-network acknowledgement.
-        LocalDateTime respondedAt = LocalDateTime.now();
+        LocalDateTime respondedAt =
+                simulatedOutcome == NetworkSubmissionResult.SubmissionStatus.SIMULATED_TIMEOUT
+                        ? null
+                        : LocalDateTime.now();
+
+        String responseMessage = switch (simulatedOutcome) {
+            case SIMULATED_ACKNOWLEDGED ->
+                    "Simulated correspondent network acknowledged the ISO 20022 payment instruction.";
+
+            case SIMULATED_NACK ->
+                    "Simulated correspondent network rejected the ISO 20022 payment instruction.";
+
+            case SIMULATED_TIMEOUT ->
+                    "No response received from the simulated correspondent network.";
+        };
 
         return new NetworkSubmissionResult(
                 getRouteType(),
                 networkReference,
-                NetworkSubmissionResult.SubmissionStatus.SIMULATED_ACKNOWLEDGED,
+                simulatedOutcome,
                 submittedAt,
                 respondedAt,
-                "Simulated correspondent network acknowledged the ISO 20022 payment instruction.",
+                responseMessage,
                 isoXmlMessage
         );
     }

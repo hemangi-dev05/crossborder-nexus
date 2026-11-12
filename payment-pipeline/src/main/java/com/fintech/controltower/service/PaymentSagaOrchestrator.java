@@ -51,7 +51,7 @@ public class PaymentSagaOrchestrator {
     }
 
     @Transactional(noRollbackFor = SecurityException.class)
-    public String executePaymentSaga(
+    public PaymentSagaResult executePaymentSaga(
             PaymentRequest request,
             String uetr
     ) {
@@ -144,7 +144,7 @@ public class PaymentSagaOrchestrator {
         PaymentNetworkAdapter adapter =
                 networkAdapterRegistry.getAdapter(routeType);
 
-        // 9. Submit the payment instruction to the simulated network.
+        // 9. Submit the payment to the simulated network.
         NetworkSubmissionResult submissionResult =
                 adapter.submit(request, uetr);
 
@@ -166,7 +166,7 @@ public class PaymentSagaOrchestrator {
             );
         }
 
-        // 10. Persist the network submission evidence.
+        // 10. Persist network submission evidence.
         NetworkSubmission networkSubmission = new NetworkSubmission(
                 ledger,
                 submissionResult.routeType(),
@@ -181,18 +181,7 @@ public class PaymentSagaOrchestrator {
 
         networkSubmissionRepository.save(networkSubmission);
 
-        // 11. Handle the simulated acknowledgement.
-        if (submissionResult.status()
-                != NetworkSubmissionResult.SubmissionStatus.SIMULATED_ACKNOWLEDGED) {
-
-            throw new IllegalStateException(
-                    "Simulated network did not acknowledge the payment. "
-                            + "Status: " + submissionResult.status()
-                            + ". Response: " + submissionResult.responseMessage()
-            );
-        }
-
-        // 12. Persist the ISO message when the adapter generated one.
+        // 11. Persist the ISO message whenever the adapter generated one.
         String isoXmlMessage = submissionResult.isoXmlMessage();
 
         if (isoXmlMessage != null && !isoXmlMessage.isBlank()) {
@@ -208,7 +197,7 @@ public class PaymentSagaOrchestrator {
             isoMessageRepository.save(isoMessage);
         }
 
-        // Cross-border submissions must contain their generated ISO message.
+        // Cross-border submissions must contain their ISO message.
         if ("CROSS_BORDER_CORRESPONDENT".equals(routeType)
                 && (isoXmlMessage == null || isoXmlMessage.isBlank())) {
 
@@ -217,27 +206,96 @@ public class PaymentSagaOrchestrator {
             );
         }
 
-        // 13. Move the payment to PROCESSING after simulated network ACK.
-        transactionStatusService.updateStatus(
-                uetr,
-                TransactionLedger.TransactionStatus.PROCESSING,
-                "Simulated network acknowledged the payment instruction. "
-                        + "Network reference: "
-                        + submissionResult.networkReference()
-        );
+        // 12. Handle all expected simulated network outcomes.
+        switch (submissionResult.status()) {
 
-        System.out.println(
-                "Simulated network submission acknowledged. "
-                        + "Route: " + routeType
-                        + ", Reference: " + submissionResult.networkReference()
-                        + ", UETR: " + uetr
-        );
+            case SIMULATED_ACKNOWLEDGED -> {
 
-        System.out.println(
-                "Payment is now PROCESSING. Settlement has not been confirmed. "
-                        + "UETR: " + uetr
-        );
+                String reason =
+                        "Simulated network acknowledged the payment instruction. "
+                                + "Network reference: "
+                                + submissionResult.networkReference();
 
-        return uetr;
+                transactionStatusService.updateStatus(
+                        uetr,
+                        TransactionLedger.TransactionStatus.PROCESSING,
+                        reason
+                );
+
+                System.out.println(
+                        "Simulated network acknowledged payment. "
+                                + "UETR: " + uetr
+                );
+
+                return new PaymentSagaResult(
+                        PaymentSagaResult.Outcome.ACKNOWLEDGED,
+                        "Payment accepted for simulated processing. "
+                                + "UETR: " + uetr
+                                + ". Network reference: "
+                                + submissionResult.networkReference()
+                );
+            }
+
+            case SIMULATED_NACK -> {
+
+                String reason =
+                        "Simulated network rejected the payment instruction. "
+                                + "Network reference: "
+                                + submissionResult.networkReference();
+
+                transactionStatusService.updateStatus(
+                        uetr,
+                        TransactionLedger.TransactionStatus.REJECTED,
+                        reason
+                );
+
+                System.out.println(
+                        "Simulated network rejected payment. "
+                                + "UETR: " + uetr
+                );
+
+                return new PaymentSagaResult(
+                        PaymentSagaResult.Outcome.REJECTED,
+                        "Simulated network rejected the payment. "
+                                + "UETR: " + uetr
+                                + ". Network reference: "
+                                + submissionResult.networkReference()
+                );
+            }
+
+            case SIMULATED_TIMEOUT -> {
+
+                String reason =
+                        "No simulated network response was received. "
+                                + "Payment is awaiting confirmation. "
+                                + "Network reference: "
+                                + submissionResult.networkReference();
+
+                transactionStatusService.updateStatus(
+                        uetr,
+                        TransactionLedger.TransactionStatus.NETWORK_PENDING,
+                        reason
+                );
+
+                System.out.println(
+                        "Simulated network timed out. "
+                                + "Payment is NETWORK_PENDING. "
+                                + "UETR: " + uetr
+                );
+
+                return new PaymentSagaResult(
+                        PaymentSagaResult.Outcome.NETWORK_PENDING,
+                        "No simulated network response was received. "
+                                + "Payment is awaiting confirmation. "
+                                + "UETR: " + uetr
+                                + ". Network reference: "
+                                + submissionResult.networkReference()
+                );
+            }
+        }
+
+        throw new IllegalStateException(
+                "Unsupported simulated network submission status."
+        );
     }
 }
