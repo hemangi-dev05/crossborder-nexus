@@ -17,7 +17,13 @@ import org.springframework.test.context.ActiveProfiles;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -40,10 +46,14 @@ class NetworkResponseIntegrationTest {
     @Autowired
     private PaymentStatusHistoryRepository historyRepository;
 
+
+    // --------------------------------------------------
+    // TEST 1: Delayed ACK
+    // --------------------------------------------------
+
     @Test
     void shouldPersistDelayedAcknowledgementAndUpdatePaymentStatus() {
 
-        // 1. Create a payment waiting for a network response
         String uetr = UUID.randomUUID().toString();
 
         TransactionLedger ledger = new TransactionLedger();
@@ -57,7 +67,6 @@ class NetworkResponseIntegrationTest {
 
         ledgerRepository.saveAndFlush(ledger);
 
-        // 2. Create the original timed-out network submission
         NetworkSubmission submission = new NetworkSubmission(
                 ledger,
                 "CROSS_BORDER_CORRESPONDENT",
@@ -72,7 +81,6 @@ class NetworkResponseIntegrationTest {
 
         Long submissionId = submission.getId();
 
-        // 3. Process a delayed ACK through the real service
         NetworkResponse response =
                 networkResponseService.processDelayedResponse(
                         submissionId,
@@ -80,7 +88,6 @@ class NetworkResponseIntegrationTest {
                         "Delayed ACK received from correspondent bank"
                 );
 
-        // 4. Verify that the response was persisted
         assertThat(response.getId()).isNotNull();
 
         NetworkResponse storedResponse =
@@ -93,14 +100,14 @@ class NetworkResponseIntegrationTest {
                         NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED
                 );
 
-        // 5. Verify that the payment status was updated in PostgreSQL
         TransactionLedger updatedLedger =
                 ledgerRepository.findById(uetr).orElseThrow();
 
         assertThat(updatedLedger.getStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.PROCESSING);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
 
-        // 6. Verify that exactly one status history record was created
         var history =
                 historyRepository.findByUetrOrderByChangedAtAsc(uetr);
 
@@ -109,21 +116,30 @@ class NetworkResponseIntegrationTest {
         PaymentStatusHistory historyEntry = history.get(0);
 
         assertThat(historyEntry.getPreviousStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.NETWORK_PENDING
+                );
 
         assertThat(historyEntry.getNewStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.PROCESSING);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
 
-        // 7. Verify that the original timeout submission remains unchanged
         NetworkSubmission originalSubmission =
                 submissionRepository.findById(submissionId).orElseThrow();
 
         assertThat(originalSubmission.getStatus())
-                .isEqualTo(NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT);
+                .isEqualTo(
+                        NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT
+                );
 
         assertThat(originalSubmission.getRespondedAt()).isNull();
     }
 
+
+    // --------------------------------------------------
+    // TEST 2: Delayed NACK
+    // --------------------------------------------------
 
     @Test
     void shouldPersistDelayedRejectionAndUpdatePaymentStatus() {
@@ -132,10 +148,14 @@ class NetworkResponseIntegrationTest {
 
         TransactionLedger ledger = new TransactionLedger();
         ledger.setUetr(uetr);
-        ledger.setTransactionId("INTEGRATION-NACK-" + UUID.randomUUID());
+        ledger.setTransactionId(
+                "INTEGRATION-NACK-" + UUID.randomUUID()
+        );
         ledger.setAmount(new BigDecimal("1800.00"));
         ledger.setCurrency("USD");
-        ledger.setStatus(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+        ledger.setStatus(
+                TransactionLedger.TransactionStatus.NETWORK_PENDING
+        );
 
         ledgerRepository.saveAndFlush(ledger);
 
@@ -150,6 +170,7 @@ class NetworkResponseIntegrationTest {
         );
 
         submission = submissionRepository.saveAndFlush(submission);
+
         Long submissionId = submission.getId();
 
         NetworkResponse response =
@@ -162,50 +183,72 @@ class NetworkResponseIntegrationTest {
         assertThat(response.getId()).isNotNull();
 
         NetworkResponse storedResponse =
-                responseRepository.findByNetworkSubmission_Id(submissionId)
+                responseRepository
+                        .findByNetworkSubmission_Id(submissionId)
                         .orElseThrow();
 
         assertThat(storedResponse.getStatus())
-                .isEqualTo(NetworkResponse.ResponseStatus.SIMULATED_NACK);
+                .isEqualTo(
+                        NetworkResponse.ResponseStatus.SIMULATED_NACK
+                );
 
         TransactionLedger updatedLedger =
                 ledgerRepository.findById(uetr).orElseThrow();
 
         assertThat(updatedLedger.getStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.REJECTED);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.REJECTED
+                );
 
         var history =
                 historyRepository.findByUetrOrderByChangedAtAsc(uetr);
 
         assertThat(history).hasSize(1);
+
         assertThat(history.get(0).getPreviousStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.NETWORK_PENDING
+                );
+
         assertThat(history.get(0).getNewStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.REJECTED);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.REJECTED
+                );
 
         NetworkSubmission originalSubmission =
                 submissionRepository.findById(submissionId).orElseThrow();
 
         assertThat(originalSubmission.getStatus())
-                .isEqualTo(NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT);
+                .isEqualTo(
+                        NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT
+                );
+
         assertThat(originalSubmission.getRespondedAt()).isNull();
     }
 
 
+    // --------------------------------------------------
+    // TEST 3: Sequential duplicate ACK
+    // --------------------------------------------------
 
     @Test
     void shouldHandleDuplicateDelayedAcknowledgementWithoutDuplicateRecords() {
 
         String uetr = UUID.randomUUID().toString();
+
         String responseMessage =
                 "Delayed ACK received from correspondent bank";
 
         TransactionLedger ledger = new TransactionLedger();
         ledger.setUetr(uetr);
-        ledger.setTransactionId("INTEGRATION-DUPLICATE-" + UUID.randomUUID());
+        ledger.setTransactionId(
+                "INTEGRATION-DUPLICATE-" + UUID.randomUUID()
+        );
         ledger.setAmount(new BigDecimal("3000.00"));
         ledger.setCurrency("USD");
-        ledger.setStatus(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+        ledger.setStatus(
+                TransactionLedger.TransactionStatus.NETWORK_PENDING
+        );
 
         ledgerRepository.saveAndFlush(ledger);
 
@@ -220,6 +263,7 @@ class NetworkResponseIntegrationTest {
         );
 
         submission = submissionRepository.saveAndFlush(submission);
+
         Long submissionId = submission.getId();
 
         NetworkResponse firstResponse =
@@ -237,36 +281,300 @@ class NetworkResponseIntegrationTest {
                 );
 
         assertThat(firstResponse.getId()).isNotNull();
+
         assertThat(duplicateResponse.getId())
                 .isEqualTo(firstResponse.getId());
 
         NetworkResponse storedResponse =
-                responseRepository.findByNetworkSubmission_Id(submissionId)
+                responseRepository
+                        .findByNetworkSubmission_Id(submissionId)
                         .orElseThrow();
 
-        assertThat(storedResponse.getId()).isEqualTo(firstResponse.getId());
+        assertThat(storedResponse.getId())
+                .isEqualTo(firstResponse.getId());
 
         TransactionLedger updatedLedger =
                 ledgerRepository.findById(uetr).orElseThrow();
 
         assertThat(updatedLedger.getStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.PROCESSING);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
 
         var history =
                 historyRepository.findByUetrOrderByChangedAtAsc(uetr);
 
         assertThat(history).hasSize(1);
+
         assertThat(history.get(0).getPreviousStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.NETWORK_PENDING
+                );
+
         assertThat(history.get(0).getNewStatus())
-                .isEqualTo(TransactionLedger.TransactionStatus.PROCESSING);
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
 
         NetworkSubmission originalSubmission =
                 submissionRepository.findById(submissionId).orElseThrow();
 
         assertThat(originalSubmission.getStatus())
-                .isEqualTo(NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT);
+                .isEqualTo(
+                        NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT
+                );
+
         assertThat(originalSubmission.getRespondedAt()).isNull();
     }
 
+
+    // --------------------------------------------------
+    // HELPER: Create a payment waiting for network response
+    // --------------------------------------------------
+
+    private TestPayment createPendingPayment(String transactionPrefix) {
+
+        String uetr = UUID.randomUUID().toString();
+
+        TransactionLedger ledger = new TransactionLedger();
+        ledger.setUetr(uetr);
+        ledger.setTransactionId(
+                transactionPrefix + UUID.randomUUID()
+        );
+        ledger.setAmount(new BigDecimal("2500.00"));
+        ledger.setCurrency("USD");
+        ledger.setStatus(
+                TransactionLedger.TransactionStatus.NETWORK_PENDING
+        );
+
+        ledgerRepository.saveAndFlush(ledger);
+
+        NetworkSubmission submission = new NetworkSubmission(
+                ledger,
+                "CROSS_BORDER_CORRESPONDENT",
+                "SIM-TEST-" + UUID.randomUUID(),
+                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
+                LocalDateTime.now().minusMinutes(5),
+                null,
+                "Original network request timed out"
+        );
+
+        submission = submissionRepository.saveAndFlush(submission);
+
+        return new TestPayment(uetr, submission.getId());
+    }
+
+    private record TestPayment(String uetr, Long submissionId) {}
+
+
+    // --------------------------------------------------
+    // TEST 4: Concurrent identical ACK requests
+    // --------------------------------------------------
+
+    @Test
+    void shouldHandleConcurrentIdenticalAcknowledgementsSafely()
+            throws Exception {
+
+        TestPayment payment =
+                createPendingPayment("CONCURRENT-ACK-");
+
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        ExecutorService executor =
+                Executors.newFixedThreadPool(2);
+
+        try {
+
+            var request =
+                    (java.util.concurrent.Callable<NetworkResponse>) () -> {
+
+                        ready.countDown();
+                        start.await();
+
+                        return networkResponseService.processDelayedResponse(
+                                payment.submissionId(),
+                                NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED,
+                                "Concurrent delayed ACK"
+                        );
+                    };
+
+            Future<NetworkResponse> first =
+                    executor.submit(request);
+
+            Future<NetworkResponse> second =
+                    executor.submit(request);
+
+            assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // Allow both requests to start.
+            start.countDown();
+
+            NetworkResponse firstResponse =
+                    first.get(15, TimeUnit.SECONDS);
+
+            NetworkResponse secondResponse =
+                    second.get(15, TimeUnit.SECONDS);
+
+            // Both requests must return the same stored response.
+            assertThat(firstResponse.getId())
+                    .isEqualTo(secondResponse.getId());
+
+            NetworkResponse storedResponse =
+                    responseRepository
+                            .findByNetworkSubmission_Id(
+                                    payment.submissionId()
+                            )
+                            .orElseThrow();
+
+            assertThat(storedResponse.getId())
+                    .isEqualTo(firstResponse.getId());
+
+            // Only one payment status transition should exist.
+            var history =
+                    historyRepository.findByUetrOrderByChangedAtAsc(
+                            payment.uetr()
+                    );
+
+            assertThat(history).hasSize(1);
+
+            TransactionLedger updatedLedger =
+                    ledgerRepository.findById(payment.uetr())
+                            .orElseThrow();
+
+            assertThat(updatedLedger.getStatus())
+                    .isEqualTo(
+                            TransactionLedger.TransactionStatus.PROCESSING
+                    );
+
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+
+    // --------------------------------------------------
+    // TEST 5: Concurrent conflicting ACK and NACK
+    // --------------------------------------------------
+
+    @Test
+    void shouldRejectOneOfTwoConcurrentConflictingResponses()
+            throws Exception {
+
+        TestPayment payment =
+                createPendingPayment("CONCURRENT-CONFLICT-");
+
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        ExecutorService executor =
+                Executors.newFixedThreadPool(2);
+
+        try {
+
+            Future<String> ackRequest = executor.submit(() -> {
+
+                ready.countDown();
+                start.await();
+
+                try {
+
+                    networkResponseService.processDelayedResponse(
+                            payment.submissionId(),
+                            NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED,
+                            "Concurrent ACK"
+                    );
+
+                    return "SUCCESS";
+
+                } catch (IllegalStateException exception) {
+                    return "CONFLICT";
+                }
+            });
+
+
+            Future<String> nackRequest = executor.submit(() -> {
+
+                ready.countDown();
+                start.await();
+
+                try {
+
+                    networkResponseService.processDelayedResponse(
+                            payment.submissionId(),
+                            NetworkResponse.ResponseStatus.SIMULATED_NACK,
+                            "Concurrent NACK"
+                    );
+
+                    return "SUCCESS";
+
+                } catch (IllegalStateException exception) {
+                    return "CONFLICT";
+                }
+            });
+
+            assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // Release both requests at approximately the same time.
+            start.countDown();
+
+            String ackResult =
+                    ackRequest.get(15, TimeUnit.SECONDS);
+
+            String nackResult =
+                    nackRequest.get(15, TimeUnit.SECONDS);
+
+            // Exactly one request should succeed.
+            assertThat(List.of(ackResult, nackResult))
+                    .containsExactlyInAnyOrder(
+                            "SUCCESS",
+                            "CONFLICT"
+                    );
+
+            // Exactly one response must be stored.
+            NetworkResponse storedResponse =
+                    responseRepository
+                            .findByNetworkSubmission_Id(
+                                    payment.submissionId()
+                            )
+                            .orElseThrow();
+
+            // The payment status must match the winning response.
+            TransactionLedger updatedLedger =
+                    ledgerRepository.findById(payment.uetr())
+                            .orElseThrow();
+
+            if (storedResponse.getStatus()
+                    == NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED) {
+
+                assertThat(updatedLedger.getStatus())
+                        .isEqualTo(
+                                TransactionLedger.TransactionStatus.PROCESSING
+                        );
+
+            } else {
+
+                assertThat(storedResponse.getStatus())
+                        .isEqualTo(
+                                NetworkResponse.ResponseStatus.SIMULATED_NACK
+                        );
+
+                assertThat(updatedLedger.getStatus())
+                        .isEqualTo(
+                                TransactionLedger.TransactionStatus.REJECTED
+                        );
+            }
+
+            // Exactly one status-history entry should exist.
+            var history =
+                    historyRepository.findByUetrOrderByChangedAtAsc(
+                            payment.uetr()
+                    );
+
+            assertThat(history).hasSize(1);
+
+        } finally {
+            executor.shutdownNow();
+        }
+    }
 }
