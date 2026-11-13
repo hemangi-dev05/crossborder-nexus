@@ -123,4 +123,150 @@ class NetworkResponseIntegrationTest {
 
         assertThat(originalSubmission.getRespondedAt()).isNull();
     }
+
+
+    @Test
+    void shouldPersistDelayedRejectionAndUpdatePaymentStatus() {
+
+        String uetr = UUID.randomUUID().toString();
+
+        TransactionLedger ledger = new TransactionLedger();
+        ledger.setUetr(uetr);
+        ledger.setTransactionId("INTEGRATION-NACK-" + UUID.randomUUID());
+        ledger.setAmount(new BigDecimal("1800.00"));
+        ledger.setCurrency("USD");
+        ledger.setStatus(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+
+        ledgerRepository.saveAndFlush(ledger);
+
+        NetworkSubmission submission = new NetworkSubmission(
+                ledger,
+                "CROSS_BORDER_CORRESPONDENT",
+                "SIM-TEST-" + UUID.randomUUID(),
+                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
+                LocalDateTime.now().minusMinutes(5),
+                null,
+                "Original network request timed out"
+        );
+
+        submission = submissionRepository.saveAndFlush(submission);
+        Long submissionId = submission.getId();
+
+        NetworkResponse response =
+                networkResponseService.processDelayedResponse(
+                        submissionId,
+                        NetworkResponse.ResponseStatus.SIMULATED_NACK,
+                        "Payment rejected by correspondent bank"
+                );
+
+        assertThat(response.getId()).isNotNull();
+
+        NetworkResponse storedResponse =
+                responseRepository.findByNetworkSubmission_Id(submissionId)
+                        .orElseThrow();
+
+        assertThat(storedResponse.getStatus())
+                .isEqualTo(NetworkResponse.ResponseStatus.SIMULATED_NACK);
+
+        TransactionLedger updatedLedger =
+                ledgerRepository.findById(uetr).orElseThrow();
+
+        assertThat(updatedLedger.getStatus())
+                .isEqualTo(TransactionLedger.TransactionStatus.REJECTED);
+
+        var history =
+                historyRepository.findByUetrOrderByChangedAtAsc(uetr);
+
+        assertThat(history).hasSize(1);
+        assertThat(history.get(0).getPreviousStatus())
+                .isEqualTo(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+        assertThat(history.get(0).getNewStatus())
+                .isEqualTo(TransactionLedger.TransactionStatus.REJECTED);
+
+        NetworkSubmission originalSubmission =
+                submissionRepository.findById(submissionId).orElseThrow();
+
+        assertThat(originalSubmission.getStatus())
+                .isEqualTo(NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT);
+        assertThat(originalSubmission.getRespondedAt()).isNull();
+    }
+
+
+
+    @Test
+    void shouldHandleDuplicateDelayedAcknowledgementWithoutDuplicateRecords() {
+
+        String uetr = UUID.randomUUID().toString();
+        String responseMessage =
+                "Delayed ACK received from correspondent bank";
+
+        TransactionLedger ledger = new TransactionLedger();
+        ledger.setUetr(uetr);
+        ledger.setTransactionId("INTEGRATION-DUPLICATE-" + UUID.randomUUID());
+        ledger.setAmount(new BigDecimal("3000.00"));
+        ledger.setCurrency("USD");
+        ledger.setStatus(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+
+        ledgerRepository.saveAndFlush(ledger);
+
+        NetworkSubmission submission = new NetworkSubmission(
+                ledger,
+                "CROSS_BORDER_CORRESPONDENT",
+                "SIM-TEST-" + UUID.randomUUID(),
+                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
+                LocalDateTime.now().minusMinutes(5),
+                null,
+                "Original network request timed out"
+        );
+
+        submission = submissionRepository.saveAndFlush(submission);
+        Long submissionId = submission.getId();
+
+        NetworkResponse firstResponse =
+                networkResponseService.processDelayedResponse(
+                        submissionId,
+                        NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED,
+                        responseMessage
+                );
+
+        NetworkResponse duplicateResponse =
+                networkResponseService.processDelayedResponse(
+                        submissionId,
+                        NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED,
+                        responseMessage
+                );
+
+        assertThat(firstResponse.getId()).isNotNull();
+        assertThat(duplicateResponse.getId())
+                .isEqualTo(firstResponse.getId());
+
+        NetworkResponse storedResponse =
+                responseRepository.findByNetworkSubmission_Id(submissionId)
+                        .orElseThrow();
+
+        assertThat(storedResponse.getId()).isEqualTo(firstResponse.getId());
+
+        TransactionLedger updatedLedger =
+                ledgerRepository.findById(uetr).orElseThrow();
+
+        assertThat(updatedLedger.getStatus())
+                .isEqualTo(TransactionLedger.TransactionStatus.PROCESSING);
+
+        var history =
+                historyRepository.findByUetrOrderByChangedAtAsc(uetr);
+
+        assertThat(history).hasSize(1);
+        assertThat(history.get(0).getPreviousStatus())
+                .isEqualTo(TransactionLedger.TransactionStatus.NETWORK_PENDING);
+        assertThat(history.get(0).getNewStatus())
+                .isEqualTo(TransactionLedger.TransactionStatus.PROCESSING);
+
+        NetworkSubmission originalSubmission =
+                submissionRepository.findById(submissionId).orElseThrow();
+
+        assertThat(originalSubmission.getStatus())
+                .isEqualTo(NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT);
+        assertThat(originalSubmission.getRespondedAt()).isNull();
+    }
+
 }
