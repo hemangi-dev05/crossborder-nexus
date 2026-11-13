@@ -10,9 +10,12 @@ import com.fintech.controltower.domain.PaymentStatusHistoryRepository;
 import com.fintech.controltower.domain.TransactionLedger;
 import com.fintech.controltower.domain.TransactionLedgerRepository;
 
+import jakarta.persistence.EntityManager;
+
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.test.context.ActiveProfiles;
 
 import java.math.BigDecimal;
@@ -26,6 +29,9 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 
 @SpringBootTest
 @ActiveProfiles("test")
@@ -43,8 +49,11 @@ class NetworkResponseIntegrationTest {
     @Autowired
     private NetworkResponseRepository responseRepository;
 
-    @Autowired
+    @SpyBean
     private PaymentStatusHistoryRepository historyRepository;
+
+    @Autowired
+    private EntityManager entityManager;
 
 
     // --------------------------------------------------
@@ -329,45 +338,6 @@ class NetworkResponseIntegrationTest {
 
 
     // --------------------------------------------------
-    // HELPER: Create a payment waiting for network response
-    // --------------------------------------------------
-
-    private TestPayment createPendingPayment(String transactionPrefix) {
-
-        String uetr = UUID.randomUUID().toString();
-
-        TransactionLedger ledger = new TransactionLedger();
-        ledger.setUetr(uetr);
-        ledger.setTransactionId(
-                transactionPrefix + UUID.randomUUID()
-        );
-        ledger.setAmount(new BigDecimal("2500.00"));
-        ledger.setCurrency("USD");
-        ledger.setStatus(
-                TransactionLedger.TransactionStatus.NETWORK_PENDING
-        );
-
-        ledgerRepository.saveAndFlush(ledger);
-
-        NetworkSubmission submission = new NetworkSubmission(
-                ledger,
-                "CROSS_BORDER_CORRESPONDENT",
-                "SIM-TEST-" + UUID.randomUUID(),
-                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
-                LocalDateTime.now().minusMinutes(5),
-                null,
-                "Original network request timed out"
-        );
-
-        submission = submissionRepository.saveAndFlush(submission);
-
-        return new TestPayment(uetr, submission.getId());
-    }
-
-    private record TestPayment(String uetr, Long submissionId) {}
-
-
-    // --------------------------------------------------
     // TEST 4: Concurrent identical ACK requests
     // --------------------------------------------------
 
@@ -407,7 +377,6 @@ class NetworkResponseIntegrationTest {
 
             assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
 
-            // Allow both requests to start.
             start.countDown();
 
             NetworkResponse firstResponse =
@@ -416,7 +385,6 @@ class NetworkResponseIntegrationTest {
             NetworkResponse secondResponse =
                     second.get(15, TimeUnit.SECONDS);
 
-            // Both requests must return the same stored response.
             assertThat(firstResponse.getId())
                     .isEqualTo(secondResponse.getId());
 
@@ -430,7 +398,6 @@ class NetworkResponseIntegrationTest {
             assertThat(storedResponse.getId())
                     .isEqualTo(firstResponse.getId());
 
-            // Only one payment status transition should exist.
             var history =
                     historyRepository.findByUetrOrderByChangedAtAsc(
                             payment.uetr()
@@ -492,7 +459,6 @@ class NetworkResponseIntegrationTest {
                 }
             });
 
-
             Future<String> nackRequest = executor.submit(() -> {
 
                 ready.countDown();
@@ -515,7 +481,6 @@ class NetworkResponseIntegrationTest {
 
             assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
 
-            // Release both requests at approximately the same time.
             start.countDown();
 
             String ackResult =
@@ -524,14 +489,12 @@ class NetworkResponseIntegrationTest {
             String nackResult =
                     nackRequest.get(15, TimeUnit.SECONDS);
 
-            // Exactly one request should succeed.
             assertThat(List.of(ackResult, nackResult))
                     .containsExactlyInAnyOrder(
                             "SUCCESS",
                             "CONFLICT"
                     );
 
-            // Exactly one response must be stored.
             NetworkResponse storedResponse =
                     responseRepository
                             .findByNetworkSubmission_Id(
@@ -539,7 +502,6 @@ class NetworkResponseIntegrationTest {
                             )
                             .orElseThrow();
 
-            // The payment status must match the winning response.
             TransactionLedger updatedLedger =
                     ledgerRepository.findById(payment.uetr())
                             .orElseThrow();
@@ -565,7 +527,6 @@ class NetworkResponseIntegrationTest {
                         );
             }
 
-            // Exactly one status-history entry should exist.
             var history =
                     historyRepository.findByUetrOrderByChangedAtAsc(
                             payment.uetr()
@@ -577,4 +538,97 @@ class NetworkResponseIntegrationTest {
             executor.shutdownNow();
         }
     }
+
+
+    // --------------------------------------------------
+    // TEST 6: Transaction rollback on history failure
+    // --------------------------------------------------
+
+    @Test
+    void shouldRollbackEntireTransactionWhenHistoryPersistenceFails() {
+
+        TestPayment payment =
+                createPendingPayment("ROLLBACK-TEST-");
+
+        doThrow(new RuntimeException(
+                "Simulated history persistence failure"
+        ))
+                .when(historyRepository)
+                .save(any(PaymentStatusHistory.class));
+
+        assertThatThrownBy(() ->
+                networkResponseService.processDelayedResponse(
+                        payment.submissionId(),
+                        NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED,
+                        "Delayed ACK for rollback test"
+                )
+        )
+                .isInstanceOf(RuntimeException.class)
+                .hasMessage("Simulated history persistence failure");
+
+        entityManager.clear();
+
+        // Network response must have been rolled back.
+        assertThat(
+                responseRepository.findByNetworkSubmission_Id(
+                        payment.submissionId()
+                )
+        ).isEmpty();
+
+        // Payment status must remain unchanged.
+        TransactionLedger ledger =
+                ledgerRepository.findById(payment.uetr()).orElseThrow();
+
+        assertThat(ledger.getStatus())
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.NETWORK_PENDING
+                );
+
+        // No history entry must have been persisted.
+        var history =
+                historyRepository.findByUetrOrderByChangedAtAsc(
+                        payment.uetr()
+                );
+
+        assertThat(history).isEmpty();
+    }
+
+
+    // --------------------------------------------------
+    // HELPER: Create a payment waiting for network response
+    // --------------------------------------------------
+
+    private TestPayment createPendingPayment(String transactionPrefix) {
+
+        String uetr = UUID.randomUUID().toString();
+
+        TransactionLedger ledger = new TransactionLedger();
+        ledger.setUetr(uetr);
+        ledger.setTransactionId(
+                transactionPrefix + UUID.randomUUID()
+        );
+        ledger.setAmount(new BigDecimal("2500.00"));
+        ledger.setCurrency("USD");
+        ledger.setStatus(
+                TransactionLedger.TransactionStatus.NETWORK_PENDING
+        );
+
+        ledgerRepository.saveAndFlush(ledger);
+
+        NetworkSubmission submission = new NetworkSubmission(
+                ledger,
+                "CROSS_BORDER_CORRESPONDENT",
+                "SIM-TEST-" + UUID.randomUUID(),
+                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
+                LocalDateTime.now().minusMinutes(5),
+                null,
+                "Original network request timed out"
+        );
+
+        submission = submissionRepository.saveAndFlush(submission);
+
+        return new TestPayment(uetr, submission.getId());
+    }
+
+    private record TestPayment(String uetr, Long submissionId) {}
 }
