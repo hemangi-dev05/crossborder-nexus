@@ -2,6 +2,7 @@
 package com.fintech.controltower.service.network;
 
 import com.fintech.controltower.domain.model.PaymentRequest;
+import com.fintech.controltower.financial.model.PaymentCalculationResult;
 import com.fintech.controltower.service.iso20022.IsoMessageCompilerService;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -34,14 +35,15 @@ public class CrossBorderAdapter implements PaymentNetworkAdapter {
     @Override
     public NetworkSubmissionResult submit(
             PaymentRequest request,
+            PaymentCalculationResult calculation,
             String uetr
     ) {
 
         LocalDateTime submittedAt = LocalDateTime.now();
 
-        // Generate and validate the ISO 20022 payment instruction.
+        // Generate ISO 20022 using the calculated destination amount.
         String isoXmlMessage =
-                isoCompilerService.compilePacs008(request, uetr);
+                isoCompilerService.compilePacs008(request, calculation, uetr);
 
         if (isoXmlMessage == null || isoXmlMessage.isBlank()) {
             throw new IllegalStateException(

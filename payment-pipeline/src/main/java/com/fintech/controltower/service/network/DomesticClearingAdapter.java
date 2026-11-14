@@ -2,6 +2,8 @@
 package com.fintech.controltower.service.network;
 
 import com.fintech.controltower.domain.model.PaymentRequest;
+import com.fintech.controltower.financial.model.PaymentCalculationResult;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -28,6 +30,7 @@ public class DomesticClearingAdapter implements PaymentNetworkAdapter {
     @Override
     public NetworkSubmissionResult submit(
             PaymentRequest request,
+            PaymentCalculationResult calculation,
             String uetr
     ) {
 

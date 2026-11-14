@@ -2,6 +2,8 @@
 package com.fintech.controltower.service.iso20022;
 
 import com.fintech.controltower.domain.model.PaymentRequest;
+import com.fintech.controltower.financial.model.AmountMode;
+import com.fintech.controltower.financial.model.PaymentCalculationResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -39,8 +41,25 @@ class IsoMessageCompilerServiceTest {
                 "US",
                 null,
                 null,
+                "USD",
+                "USD",
+                AmountMode.SOURCE_AMOUNT,
+                new BigDecimal("1250.50")
+        );
+    }
+
+    private PaymentCalculationResult createValidCalculation() {
+        return new PaymentCalculationResult(
+                AmountMode.SOURCE_AMOUNT,
+                "CROSS_BORDER_CORRESPONDENT",
+                "USD",
+                "USD",
                 new BigDecimal("1250.50"),
-                "USD"
+                new BigDecimal("1250.50"),
+                BigDecimal.ONE,
+                new BigDecimal("5.00"),
+                "USD",
+                new BigDecimal("1255.50")
         );
     }
 
@@ -49,6 +68,7 @@ class IsoMessageCompilerServiceTest {
 
         String xml = compiler.compilePacs008(
                 createValidPayment(),
+                createValidCalculation(),
                 VALID_UETR
         );
 
@@ -62,11 +82,40 @@ class IsoMessageCompilerServiceTest {
     }
 
     @Test
+    void shouldUseCalculatedDestinationAmountAndCurrency() {
+
+        PaymentCalculationResult calculation =
+                new PaymentCalculationResult(
+                        AmountMode.SOURCE_AMOUNT,
+                        "CROSS_BORDER_CORRESPONDENT",
+                        "INR",
+                        "USD",
+                        new BigDecimal("85000.00"),
+                        new BigDecimal("1003.54"),
+                        new BigDecimal("84.70"),
+                        new BigDecimal("250.00"),
+                        "INR",
+                        new BigDecimal("85250.00")
+                );
+
+        String xml = compiler.compilePacs008(
+                createValidPayment(),
+                calculation,
+                VALID_UETR
+        );
+
+        assertThat(xml).contains("Ccy=\"USD\"");
+        assertThat(xml).contains("1003.54");
+        assertThat(xml).doesNotContain("85000.00");
+    }
+
+    @Test
     void shouldRejectInvalidUetr() {
 
         assertThatThrownBy(() ->
                 compiler.compilePacs008(
                         createValidPayment(),
+                        createValidCalculation(),
                         "invalid-uetr"
                 )
         ).isInstanceOf(IllegalArgumentException.class)
@@ -74,30 +123,30 @@ class IsoMessageCompilerServiceTest {
     }
 
     @Test
-    void shouldRejectZeroAmount() {
+    void shouldRejectZeroDestinationAmount() {
 
-        PaymentRequest payment = new PaymentRequest(
-                "TXN-2026-002",
-                "Hemangi Sharma",
-                "123456789012",
-                "DEUTDEFF",
-                "DE",
-                null,
-                null,
-                "John Smith",
-                "987654321098",
-                "CHASUS33",
-                "US",
-                null,
-                null,
-                BigDecimal.ZERO,
-                "USD"
-        );
+        PaymentCalculationResult calculation =
+                new PaymentCalculationResult(
+                        AmountMode.SOURCE_AMOUNT,
+                        "CROSS_BORDER_CORRESPONDENT",
+                        "USD",
+                        "USD",
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        BigDecimal.ONE,
+                        BigDecimal.ZERO,
+                        "USD",
+                        BigDecimal.ZERO
+                );
 
         assertThatThrownBy(() ->
-                compiler.compilePacs008(payment, VALID_UETR)
+                compiler.compilePacs008(
+                        createValidPayment(),
+                        calculation,
+                        VALID_UETR
+                )
         ).isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Amount");
+                .hasMessageContaining("destination amount");
     }
 
     @Test
@@ -117,12 +166,18 @@ class IsoMessageCompilerServiceTest {
                 "US",
                 null,
                 null,
-                new BigDecimal("500.00"),
-                "USD"
+                "USD",
+                "USD",
+                AmountMode.SOURCE_AMOUNT,
+                new BigDecimal("500.00")
         );
 
         assertThatThrownBy(() ->
-                compiler.compilePacs008(payment, VALID_UETR)
+                compiler.compilePacs008(
+                        payment,
+                        createValidCalculation(),
+                        VALID_UETR
+                )
         ).isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Debtor bank");
     }
@@ -160,12 +215,18 @@ class IsoMessageCompilerServiceTest {
                 "US",
                 null,
                 null,
-                new BigDecimal("500.00"),
-                "USD"
+                "USD",
+                "USD",
+                AmountMode.SOURCE_AMOUNT,
+                new BigDecimal("500.00")
         );
 
         assertThatThrownBy(() ->
-                compiler.compilePacs008(payment, VALID_UETR)
+                compiler.compilePacs008(
+                        payment,
+                        createValidCalculation(),
+                        VALID_UETR
+                )
         ).isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("BIC");
     }

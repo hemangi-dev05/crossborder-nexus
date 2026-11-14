@@ -4,8 +4,8 @@ package com.fintech.controltower.api.controller;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fintech.controltower.domain.model.PaymentRequest;
-import com.fintech.controltower.domain.entity.IdempotencyRecord;
 import com.fintech.controltower.exception.IdempotencyConflictException;
+import com.fintech.controltower.financial.model.AmountMode;
 import com.fintech.controltower.service.idempotency.PaymentIdempotencyService;
 import com.fintech.controltower.service.idempotency.PaymentIdempotencyService.PaymentResult;
 
@@ -22,6 +22,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.math.BigDecimal;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 @RestController
@@ -149,25 +150,49 @@ public class PaymentIngestionController {
             return "Request body is required";
         }
 
-        BigDecimal amount = request.amount();
-
-        if (amount == null) {
-            return "Transaction amount is required";
+        if (request.enteredAmount() == null) {
+            return "Entered amount is required";
         }
 
-        if (amount.compareTo(BigDecimal.ZERO) <= 0) {
-            return "Transaction amount must be greater than zero";
+        if (request.enteredAmount().compareTo(BigDecimal.ZERO) <= 0) {
+            return "Entered amount must be greater than zero";
         }
 
-        if (request.currency() == null
-                || !CURRENCY_PATTERN.matcher(
-                request.currency().trim()
-        ).matches()) {
+        if (!isValidCurrency(request.sourceCurrency())) {
+            return "Source currency must contain exactly three letters";
+        }
 
-            return "Currency must contain exactly three letters";
+        if (!isValidCurrency(request.destinationCurrency())) {
+            return "Destination currency must contain exactly three letters";
+        }
+
+        if (request.amountMode() == null) {
+            return "Amount mode must be SOURCE_AMOUNT or RECEIVER_AMOUNT";
         }
 
         return null;
+    }
+
+    private boolean isValidCurrency(String currency) {
+
+        return currency != null
+                && CURRENCY_PATTERN.matcher(
+                currency.trim()
+        ).matches()
+                && isSupportedCurrency(currency);
+    }
+
+    private boolean isSupportedCurrency(String currency) {
+
+        try {
+            java.util.Currency.getInstance(
+                    currency.trim().toUpperCase(Locale.ROOT)
+            );
+            return true;
+
+        } catch (IllegalArgumentException exception) {
+            return false;
+        }
     }
 
     private String jsonResponseString(

@@ -2,6 +2,7 @@
 package com.fintech.controltower.service.iso20022;
 
 import com.fintech.controltower.domain.model.PaymentRequest;
+import com.fintech.controltower.financial.model.PaymentCalculationResult;
 import org.springframework.stereotype.Service;
 
 import javax.xml.stream.XMLOutputFactory;
@@ -22,14 +23,12 @@ public class IsoMessageCompilerService {
     private static final String NAMESPACE =
             "urn:iso:std:iso:20022:tech:xsd:pacs.008.001.14";
 
-    // Project simulation policy: charges are shared.
     private static final String CHARGE_BEARER = "SHAR";
 
     private static final Pattern UETR_PATTERN = Pattern.compile(
             "[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}"
     );
 
-    // Matches the BIC format defined in the pacs.008 XSD.
     private static final Pattern BIC_PATTERN = Pattern.compile(
             "[A-Z0-9]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?"
     );
@@ -42,10 +41,15 @@ public class IsoMessageCompilerService {
         this.isoMessageValidatorService = isoMessageValidatorService;
     }
 
-    public String compilePacs008(PaymentRequest request, String uetr) {
-        validate(request, uetr);
+    public String compilePacs008(
+            PaymentRequest request,
+            PaymentCalculationResult calculation,
+            String uetr
+    ) {
 
-        String currency = request.currency()
+        validate(request, calculation, uetr);
+
+        String currency = calculation.destinationCurrency()
                 .trim()
                 .toUpperCase(Locale.ROOT);
 
@@ -63,21 +67,23 @@ public class IsoMessageCompilerService {
 
             xml.writeStartDocument("UTF-8", "1.0");
 
-            // Root document
             start(xml, "Document");
             xml.writeDefaultNamespace(NAMESPACE);
 
-            // Financial institution to financial institution transfer
             start(xml, "FIToFICstmrCdtTrf");
 
             writeGroupHeader(xml, messageId, timestamp);
 
             writeCreditTransferTransaction(
-                    xml, request, uetr, currency
+                    xml,
+                    request,
+                    calculation,
+                    uetr,
+                    currency
             );
 
-            xml.writeEndElement(); // FIToFICstmrCdtTrf
-            xml.writeEndElement(); // Document
+            xml.writeEndElement();
+            xml.writeEndElement();
 
             xml.writeEndDocument();
             xml.flush();
@@ -85,14 +91,14 @@ public class IsoMessageCompilerService {
 
             String generatedXml = output.toString();
 
-            // Validate generated XML against the actual ISO 20022 XSD.
             isoMessageValidatorService.validate(generatedXml);
 
             return generatedXml;
 
         } catch (XMLStreamException e) {
             throw new IllegalStateException(
-                    "Unable to generate ISO 20022 pacs.008 XML", e
+                    "Unable to generate ISO 20022 pacs.008 XML",
+                    e
             );
         }
     }
@@ -111,14 +117,15 @@ public class IsoMessageCompilerService {
 
         start(xml, "SttlmInf");
         writeElement(xml, "SttlmMtd", "CLRG");
-        xml.writeEndElement(); // SttlmInf
+        xml.writeEndElement();
 
-        xml.writeEndElement(); // GrpHdr
+        xml.writeEndElement();
     }
 
     private void writeCreditTransferTransaction(
             XMLStreamWriter xml,
             PaymentRequest request,
+            PaymentCalculationResult calculation,
             String uetr,
             String currency
     ) throws XMLStreamException {
@@ -129,15 +136,17 @@ public class IsoMessageCompilerService {
         start(xml, "PmtId");
         writeElement(xml, "EndToEndId", request.transactionId().trim());
         writeElement(xml, "UETR", uetr);
-        xml.writeEndElement(); // PmtId
-
-        // 2. Interbank settlement amount
-        start(xml, "IntrBkSttlmAmt");
-        xml.writeAttribute("Ccy", currency);
-        xml.writeCharacters(request.amount().toPlainString());
         xml.writeEndElement();
 
-        // 3. Settlement date for simulation
+        // 2. Calculated destination settlement amount
+        start(xml, "IntrBkSttlmAmt");
+        xml.writeAttribute("Ccy", currency);
+        xml.writeCharacters(
+                calculation.destinationAmount().toPlainString()
+        );
+        xml.writeEndElement();
+
+        // 3. Settlement date
         writeElement(
                 xml,
                 "IntrBkSttlmDt",
@@ -159,7 +168,7 @@ public class IsoMessageCompilerService {
                 request.debtorAccountNumber()
         );
 
-        // 7. Debtor's financial institution
+        // 7. Debtor agent
         writeAgent(
                 xml,
                 "DbtrAgt",
@@ -168,7 +177,7 @@ public class IsoMessageCompilerService {
                 request.debtorClearingMemberId()
         );
 
-        // 8. Creditor's financial institution
+        // 8. Creditor agent
         writeAgent(
                 xml,
                 "CdtrAgt",
@@ -189,7 +198,7 @@ public class IsoMessageCompilerService {
                 request.creditorAccountNumber()
         );
 
-        xml.writeEndElement(); // CdtTrfTxInf
+        xml.writeEndElement();
     }
 
     private void writeAccount(
@@ -204,10 +213,10 @@ public class IsoMessageCompilerService {
 
         start(xml, "Othr");
         writeElement(xml, "Id", accountNumber.trim());
-        xml.writeEndElement(); // Othr
+        xml.writeEndElement();
 
-        xml.writeEndElement(); // Id
-        xml.writeEndElement(); // Account
+        xml.writeEndElement();
+        xml.writeEndElement();
     }
 
     private void writeAgent(
@@ -245,7 +254,7 @@ public class IsoMessageCompilerService {
                         clearingSystemCode.trim()
                 );
 
-                xml.writeEndElement(); // ClrSysId
+                xml.writeEndElement();
             }
 
             writeElement(
@@ -254,11 +263,11 @@ public class IsoMessageCompilerService {
                     clearingMemberId.trim()
             );
 
-            xml.writeEndElement(); // ClrSysMmbId
+            xml.writeEndElement();
         }
 
-        xml.writeEndElement(); // FinInstnId
-        xml.writeEndElement(); // Agent
+        xml.writeEndElement();
+        xml.writeEndElement();
     }
 
     private static void start(
@@ -282,12 +291,19 @@ public class IsoMessageCompilerService {
 
     private static void validate(
             PaymentRequest request,
+            PaymentCalculationResult calculation,
             String uetr
     ) {
 
         if (request == null) {
             throw new IllegalArgumentException(
                     "PaymentRequest must not be null"
+            );
+        }
+
+        if (calculation == null) {
+            throw new IllegalArgumentException(
+                    "Payment calculation result must not be null"
             );
         }
 
@@ -327,30 +343,34 @@ public class IsoMessageCompilerService {
                 "Creditor"
         );
 
-        if (request.amount() == null
-                || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
+        BigDecimal destinationAmount = calculation.destinationAmount();
+
+        if (destinationAmount == null
+                || destinationAmount.compareTo(BigDecimal.ZERO) <= 0) {
 
             throw new IllegalArgumentException(
-                    "Amount must be greater than zero"
+                    "Calculated destination amount must be greater than zero"
             );
         }
 
         BigDecimal normalizedAmount =
-                request.amount().stripTrailingZeros();
+                destinationAmount.stripTrailingZeros();
 
         if (normalizedAmount.precision() > 18
                 || normalizedAmount.scale() > 5) {
 
             throw new IllegalArgumentException(
-                    "Amount exceeds ISO 20022 precision limits"
+                    "Destination amount exceeds ISO 20022 precision limits"
             );
         }
 
-        if (request.currency() == null
-                || !request.currency().trim().matches("[A-Za-z]{3}")) {
+        if (calculation.destinationCurrency() == null
+                || !calculation.destinationCurrency()
+                .trim()
+                .matches("[A-Za-z]{3}")) {
 
             throw new IllegalArgumentException(
-                    "Currency must contain exactly three letters"
+                    "Destination currency must contain exactly three letters"
             );
         }
     }
@@ -424,8 +444,7 @@ public class IsoMessageCompilerService {
 
         if (value.trim().length() > maxLength) {
             throw new IllegalArgumentException(
-                    field + " must not exceed "
-                            + maxLength + " characters"
+                    field + " must not exceed " + maxLength + " characters"
             );
         }
     }

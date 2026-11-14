@@ -1,9 +1,12 @@
 
 package com.fintech.controltower.domain.model;
 
+import com.fintech.controltower.financial.model.AmountMode;
+
 import java.math.BigDecimal;
 
 public record PaymentRequest(
+
         String transactionId,
 
         // Sending customer
@@ -23,6 +26,9 @@ public record PaymentRequest(
         String creditorClearingMemberId,
 
         // Payment details
-        BigDecimal amount,
-        String currency
+        String sourceCurrency,
+        String destinationCurrency,
+        AmountMode amountMode,
+        BigDecimal enteredAmount
+
 ) {}

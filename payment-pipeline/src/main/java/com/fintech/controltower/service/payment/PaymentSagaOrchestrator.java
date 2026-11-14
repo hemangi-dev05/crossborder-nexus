@@ -1,18 +1,25 @@
 
 package com.fintech.controltower.service.payment;
 
-import com.fintech.controltower.service.aml.AmlScreeningService;
-
 import com.fintech.controltower.domain.entity.IsoMessage;
-import com.fintech.controltower.domain.repository.IsoMessageRepository;
 import com.fintech.controltower.domain.entity.NetworkSubmission;
-import com.fintech.controltower.domain.repository.NetworkSubmissionRepository;
-import com.fintech.controltower.domain.model.PaymentRequest;
 import com.fintech.controltower.domain.entity.PaymentStatusHistory;
-import com.fintech.controltower.domain.repository.PaymentStatusHistoryRepository;
 import com.fintech.controltower.domain.entity.TransactionLedger;
+
+import com.fintech.controltower.domain.model.PaymentRequest;
+
+import com.fintech.controltower.domain.repository.IsoMessageRepository;
+import com.fintech.controltower.domain.repository.NetworkSubmissionRepository;
+import com.fintech.controltower.domain.repository.PaymentStatusHistoryRepository;
 import com.fintech.controltower.domain.repository.TransactionLedgerRepository;
+
 import com.fintech.controltower.exception.AmlHoldException;
+
+import com.fintech.controltower.financial.model.PaymentCalculationRequest;
+import com.fintech.controltower.financial.model.PaymentCalculationResult;
+import com.fintech.controltower.financial.service.FinancialCalculationService;
+
+import com.fintech.controltower.service.aml.AmlScreeningService;
 import com.fintech.controltower.service.network.NetworkAdapterRegistry;
 import com.fintech.controltower.service.network.NetworkSubmissionResult;
 import com.fintech.controltower.service.network.PaymentNetworkAdapter;
@@ -28,7 +35,7 @@ public class PaymentSagaOrchestrator {
     private final IsoMessageRepository isoMessageRepository;
     private final NetworkSubmissionRepository networkSubmissionRepository;
     private final AmlScreeningService amlScreeningService;
-    private final PaymentRoutingService paymentRoutingService;
+    private final FinancialCalculationService financialCalculationService;
     private final NetworkAdapterRegistry networkAdapterRegistry;
     private final TransactionStatusService transactionStatusService;
 
@@ -38,7 +45,7 @@ public class PaymentSagaOrchestrator {
             IsoMessageRepository isoMessageRepository,
             NetworkSubmissionRepository networkSubmissionRepository,
             AmlScreeningService amlScreeningService,
-            PaymentRoutingService paymentRoutingService,
+            FinancialCalculationService financialCalculationService,
             NetworkAdapterRegistry networkAdapterRegistry,
             TransactionStatusService transactionStatusService
     ) {
@@ -47,7 +54,7 @@ public class PaymentSagaOrchestrator {
         this.isoMessageRepository = isoMessageRepository;
         this.networkSubmissionRepository = networkSubmissionRepository;
         this.amlScreeningService = amlScreeningService;
-        this.paymentRoutingService = paymentRoutingService;
+        this.financialCalculationService = financialCalculationService;
         this.networkAdapterRegistry = networkAdapterRegistry;
         this.transactionStatusService = transactionStatusService;
     }
@@ -58,13 +65,27 @@ public class PaymentSagaOrchestrator {
             String uetr
     ) {
 
-        // 1. Initialize the transaction ledger.
+        // 1. Calculate the financial instruction exactly once.
+        PaymentCalculationRequest calculationRequest =
+                new PaymentCalculationRequest(
+                        request.debtorCountryCode(),
+                        request.creditorCountryCode(),
+                        request.sourceCurrency(),
+                        request.destinationCurrency(),
+                        request.amountMode(),
+                        request.enteredAmount()
+                );
+
+        PaymentCalculationResult calculation =
+                financialCalculationService.calculate(calculationRequest);
+
+        // 2. Initialize the transaction ledger.
         TransactionLedger ledger = new TransactionLedger();
 
         ledger.setUetr(uetr);
         ledger.setTransactionId(request.transactionId());
 
-        // 2. Map sender details.
+        // 3. Map sender details.
         ledger.setDebtorName(request.debtorName());
         ledger.setDebtorAccountNumber(request.debtorAccountNumber());
         ledger.setDebtorBic(request.debtorBic());
@@ -76,7 +97,7 @@ public class PaymentSagaOrchestrator {
                 request.debtorClearingMemberId()
         );
 
-        // 3. Map beneficiary details.
+        // 4. Map beneficiary details.
         ledger.setCreditorName(request.creditorName());
         ledger.setCreditorAccountNumber(request.creditorAccountNumber());
         ledger.setCreditorBic(request.creditorBic());
@@ -88,11 +109,20 @@ public class PaymentSagaOrchestrator {
                 request.creditorClearingMemberId()
         );
 
-        // 4. Map payment details.
-        ledger.setAmount(request.amount());
-        ledger.setCurrency(request.currency());
+        // 5. Persist the calculated financial instruction.
+        // amount and currency represent source principal and source currency.
+        ledger.setAmount(calculation.sourcePrincipal());
+        ledger.setCurrency(calculation.sourceCurrency());
 
-        // 5. Perform AML screening.
+        ledger.setAmountMode(calculation.amountMode());
+        ledger.setDestinationAmount(calculation.destinationAmount());
+        ledger.setDestinationCurrency(calculation.destinationCurrency());
+        ledger.setExchangeRate(calculation.exchangeRate());
+        ledger.setTransferFee(calculation.transferFee());
+        ledger.setFeeCurrency(calculation.feeCurrency());
+        ledger.setTotalSenderDebit(calculation.totalSenderDebit());
+
+        // 6. Perform AML screening.
         AmlScreeningService.AmlScreeningResult screeningResult =
                 amlScreeningService.screenTransaction(request);
 
@@ -119,14 +149,10 @@ public class PaymentSagaOrchestrator {
             );
         }
 
-        // 6. Determine the configured payment route.
-        String routeType = paymentRoutingService.determineRoute(
-                request.debtorCountryCode(),
-                request.creditorCountryCode(),
-                request.currency()
-        );
+        // 7. Use the route determined during financial calculation.
+        String routeType = calculation.routeType();
 
-        // 7. Mark the payment as accepted by our platform.
+        // 8. Mark the payment as accepted by our platform.
         ledger.setStatus(
                 TransactionLedger.TransactionStatus.ACCEPTED
         );
@@ -142,13 +168,13 @@ public class PaymentSagaOrchestrator {
 
         historyRepository.save(initialHistory);
 
-        // 8. Find the adapter responsible for this route.
+        // 9. Find the adapter responsible for this route.
         PaymentNetworkAdapter adapter =
                 networkAdapterRegistry.getAdapter(routeType);
 
-        // 9. Submit the payment to the simulated network.
+        // 10. Submit the original request with the same calculated result.
         NetworkSubmissionResult submissionResult =
-                adapter.submit(request, uetr);
+                adapter.submit(request, calculation, uetr);
 
         if (submissionResult == null) {
             throw new IllegalStateException(
@@ -168,7 +194,7 @@ public class PaymentSagaOrchestrator {
             );
         }
 
-        // 10. Persist network submission evidence.
+        // 11. Persist network submission evidence.
         NetworkSubmission networkSubmission = new NetworkSubmission(
                 ledger,
                 submissionResult.routeType(),
@@ -183,7 +209,7 @@ public class PaymentSagaOrchestrator {
 
         networkSubmissionRepository.save(networkSubmission);
 
-        // 11. Persist the ISO message whenever the adapter generated one.
+        // 12. Persist the ISO message whenever the adapter generated one.
         String isoXmlMessage = submissionResult.isoXmlMessage();
 
         if (isoXmlMessage != null && !isoXmlMessage.isBlank()) {
@@ -208,7 +234,7 @@ public class PaymentSagaOrchestrator {
             );
         }
 
-        // 12. Handle all expected simulated network outcomes.
+        // 13. Handle all expected simulated network outcomes.
         switch (submissionResult.status()) {
 
             case SIMULATED_ACKNOWLEDGED -> {

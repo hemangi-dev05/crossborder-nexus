@@ -1,7 +1,9 @@
 
 package com.fintech.controltower.domain.entity;
 
+import com.fintech.controltower.financial.model.AmountMode;
 import jakarta.persistence.*;
+
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
@@ -45,9 +47,35 @@ public class TransactionLedger {
     private String creditorClearingSystemCode;
     private String creditorClearingMemberId;
 
-    // Payment details
+    // Payment details: source principal
+    @Column(precision = 19, scale = 5)
     private BigDecimal amount;
+
+    @Column(length = 3)
     private String currency;
+
+    // Financial calculation details
+    @Enumerated(EnumType.STRING)
+    @Column(length = 30)
+    private AmountMode amountMode;
+
+    @Column(precision = 19, scale = 5)
+    private BigDecimal destinationAmount;
+
+    @Column(length = 3)
+    private String destinationCurrency;
+
+    @Column(precision = 19, scale = 8)
+    private BigDecimal exchangeRate;
+
+    @Column(precision = 19, scale = 5)
+    private BigDecimal transferFee;
+
+    @Column(length = 3)
+    private String feeCurrency;
+
+    @Column(precision = 19, scale = 5)
+    private BigDecimal totalSenderDebit;
 
     // Payment lifecycle
     @Enumerated(EnumType.STRING)
@@ -126,6 +154,27 @@ public class TransactionLedger {
 
     public String getCurrency() { return currency; }
     public void setCurrency(String currency) { this.currency = currency; }
+
+    public AmountMode getAmountMode() { return amountMode; }
+    public void setAmountMode(AmountMode amountMode) { this.amountMode = amountMode; }
+
+    public BigDecimal getDestinationAmount() { return destinationAmount; }
+    public void setDestinationAmount(BigDecimal destinationAmount) { this.destinationAmount = destinationAmount; }
+
+    public String getDestinationCurrency() { return destinationCurrency; }
+    public void setDestinationCurrency(String destinationCurrency) { this.destinationCurrency = destinationCurrency; }
+
+    public BigDecimal getExchangeRate() { return exchangeRate; }
+    public void setExchangeRate(BigDecimal exchangeRate) { this.exchangeRate = exchangeRate; }
+
+    public BigDecimal getTransferFee() { return transferFee; }
+    public void setTransferFee(BigDecimal transferFee) { this.transferFee = transferFee; }
+
+    public String getFeeCurrency() { return feeCurrency; }
+    public void setFeeCurrency(String feeCurrency) { this.feeCurrency = feeCurrency; }
+
+    public BigDecimal getTotalSenderDebit() { return totalSenderDebit; }
+    public void setTotalSenderDebit(BigDecimal totalSenderDebit) { this.totalSenderDebit = totalSenderDebit; }
 
     public TransactionStatus getStatus() { return status; }
     public void setStatus(TransactionStatus status) { this.status = status; }
