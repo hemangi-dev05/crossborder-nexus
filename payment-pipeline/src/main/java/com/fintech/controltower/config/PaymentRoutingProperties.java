@@ -25,7 +25,7 @@ public class PaymentRoutingProperties {
 
         private String debtorCountryCode;
         private String creditorCountryCode;
-        private String currency;
+        private String settlementCurrency;
         private String routeType;
         private boolean enabled;
 
@@ -45,12 +45,12 @@ public class PaymentRoutingProperties {
             this.creditorCountryCode = creditorCountryCode;
         }
 
-        public String getCurrency() {
-            return currency;
+        public String getSettlementCurrency() {
+            return settlementCurrency;
         }
 
-        public void setCurrency(String currency) {
-            this.currency = currency;
+        public void setSettlementCurrency(String settlementCurrency) {
+            this.settlementCurrency = settlementCurrency;
         }
 
         public String getRouteType() {

@@ -3,11 +3,11 @@ package com.fintech.controltower.api.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.fintech.controltower.domain.PaymentRequest;
-import com.fintech.controltower.domain.IdempotencyRecord;
+import com.fintech.controltower.domain.model.PaymentRequest;
+import com.fintech.controltower.domain.entity.IdempotencyRecord;
 import com.fintech.controltower.exception.IdempotencyConflictException;
-import com.fintech.controltower.service.PaymentIdempotencyService;
-import com.fintech.controltower.service.PaymentIdempotencyService.PaymentResult;
+import com.fintech.controltower.service.idempotency.PaymentIdempotencyService;
+import com.fintech.controltower.service.idempotency.PaymentIdempotencyService.PaymentResult;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

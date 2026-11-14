@@ -1,7 +1,7 @@
 
 package com.fintech.controltower.api.dto;
 
-import com.fintech.controltower.domain.NetworkResponse;
+import com.fintech.controltower.domain.entity.NetworkResponse;
 
 import java.time.LocalDateTime;
 

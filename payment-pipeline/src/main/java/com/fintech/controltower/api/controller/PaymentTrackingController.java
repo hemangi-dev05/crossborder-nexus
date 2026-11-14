@@ -7,8 +7,8 @@ import com.fintech.controltower.api.dto.PaymentHistoryResponse;
 import com.fintech.controltower.api.dto.IsoMessageResponse;
 import com.fintech.controltower.api.dto.PaymentTrackingResponse;
 
-import com.fintech.controltower.domain.TransactionLedger;
-import com.fintech.controltower.service.PaymentTrackingService;
+import com.fintech.controltower.domain.entity.TransactionLedger;
+import com.fintech.controltower.service.tracking.PaymentTrackingService;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;

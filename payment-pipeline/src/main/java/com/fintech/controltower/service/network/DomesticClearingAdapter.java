@@ -1,7 +1,7 @@
 
 package com.fintech.controltower.service.network;
 
-import com.fintech.controltower.domain.PaymentRequest;
+import com.fintech.controltower.domain.model.PaymentRequest;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 

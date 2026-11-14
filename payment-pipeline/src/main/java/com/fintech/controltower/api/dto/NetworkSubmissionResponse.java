@@ -1,6 +1,6 @@
 package com.fintech.controltower.api.dto;
 
-import com.fintech.controltower.domain.NetworkSubmission;
+import com.fintech.controltower.domain.entity.NetworkSubmission;
 
 import java.time.LocalDateTime;
 

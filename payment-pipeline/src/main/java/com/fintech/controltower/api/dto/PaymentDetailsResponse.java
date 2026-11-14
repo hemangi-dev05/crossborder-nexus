@@ -1,6 +1,6 @@
 package com.fintech.controltower.api.dto;
 
-import com.fintech.controltower.domain.TransactionLedger;
+import com.fintech.controltower.domain.entity.TransactionLedger;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 

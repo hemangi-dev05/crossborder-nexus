@@ -5,10 +5,10 @@ import com.fintech.controltower.api.dto.DelayedNetworkResponseRequest;
 import com.fintech.controltower.api.dto.NetworkResponseApiResponse;
 import com.fintech.controltower.api.dto.PaymentStatusResponse;
 import com.fintech.controltower.api.dto.StatusUpdateRequest;
-import com.fintech.controltower.domain.NetworkResponse;
-import com.fintech.controltower.domain.TransactionLedger;
-import com.fintech.controltower.service.NetworkResponseService;
-import com.fintech.controltower.service.TransactionStatusService;
+import com.fintech.controltower.domain.entity.NetworkResponse;
+import com.fintech.controltower.domain.entity.TransactionLedger;
+import com.fintech.controltower.service.network.NetworkResponseService;
+import com.fintech.controltower.service.payment.TransactionStatusService;
 
 import jakarta.persistence.EntityNotFoundException;
 

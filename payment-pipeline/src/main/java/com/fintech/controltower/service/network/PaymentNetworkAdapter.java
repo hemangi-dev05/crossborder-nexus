@@ -1,6 +1,6 @@
 package com.fintech.controltower.service.network;
 
-import com.fintech.controltower.domain.PaymentRequest;
+import com.fintech.controltower.domain.model.PaymentRequest;
 
 public interface PaymentNetworkAdapter {
 
