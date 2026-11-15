@@ -1,3 +1,4 @@
+
 package com.fintech.controltower.financial.service;
 
 import com.fintech.controltower.config.PaymentFinancialProperties;
@@ -22,13 +23,16 @@ public class FinancialCalculationService {
 
     private final PaymentFinancialProperties financialProperties;
     private final PaymentRoutingService routingService;
+    private final FxRateService fxRateService;
 
     public FinancialCalculationService(
             PaymentFinancialProperties financialProperties,
-            PaymentRoutingService routingService
+            PaymentRoutingService routingService,
+            FxRateService fxRateService
     ) {
         this.financialProperties = financialProperties;
         this.routingService = routingService;
+        this.fxRateService = fxRateService;
     }
 
     public PaymentCalculationResult calculate(
@@ -116,6 +120,7 @@ public class FinancialCalculationService {
         );
     }
 
+
     private BigDecimal getExchangeRate(
             String sourceCurrency,
             String destinationCurrency
@@ -124,21 +129,12 @@ public class FinancialCalculationService {
             return BigDecimal.ONE;
         }
 
-        String key = sourceCurrency + "_" + destinationCurrency;
-
-        BigDecimal rate = findConfiguredValue(
-                financialProperties.getFxRates(),
-                key
-        );
-
-        if (rate == null || rate.compareTo(BigDecimal.ZERO) <= 0) {
-            throw new IllegalStateException(
-                    "Missing or invalid FX rate configuration for " + key
-            );
-        }
-
-        return rate;
+        return fxRateService.getRate(
+                sourceCurrency,
+                destinationCurrency
+        ).rate();
     }
+
 
     private BigDecimal getTransferFee(
             String routeType,
