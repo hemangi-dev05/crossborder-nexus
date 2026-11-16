@@ -64,8 +64,8 @@ public class TransactionStatusService {
             );
         }
 
-        // 1. Retrieve payment
-        TransactionLedger ledger = ledgerRepository.findById(uetr)
+        // 1. Retrieve payment with a pessimistic write lock
+        TransactionLedger ledger = ledgerRepository.findByUetrForUpdate(uetr)
                 .orElseThrow(() ->
                         new IllegalArgumentException(
                                 "Payment not found for UETR: " + uetr

@@ -6,6 +6,7 @@ import com.fintech.controltower.api.dto.PaymentPageResponse;
 import com.fintech.controltower.api.dto.PaymentHistoryResponse;
 import com.fintech.controltower.api.dto.IsoMessageResponse;
 import com.fintech.controltower.api.dto.NetworkSubmissionResponse;
+import com.fintech.controltower.api.dto.NetworkResponseApiResponse;
 import com.fintech.controltower.api.dto.PaymentTrackingResponse;
 
 import com.fintech.controltower.domain.entity.TransactionLedger;
@@ -15,7 +16,9 @@ import com.fintech.controltower.domain.repository.PaymentStatusHistoryRepository
 import com.fintech.controltower.domain.entity.IsoMessage;
 import com.fintech.controltower.domain.repository.IsoMessageRepository;
 import com.fintech.controltower.domain.entity.NetworkSubmission;
+import com.fintech.controltower.domain.entity.NetworkResponse;
 import com.fintech.controltower.domain.repository.NetworkSubmissionRepository;
+import com.fintech.controltower.domain.repository.NetworkResponseRepository;
 
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -25,6 +28,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 @Service
 public class PaymentTrackingService {
@@ -33,21 +38,28 @@ public class PaymentTrackingService {
     private final PaymentStatusHistoryRepository historyRepository;
     private final IsoMessageRepository isoMessageRepository;
     private final NetworkSubmissionRepository networkSubmissionRepository;
+    private final NetworkResponseRepository networkResponseRepository;
 
     public PaymentTrackingService(
             TransactionLedgerRepository ledgerRepository,
             PaymentStatusHistoryRepository historyRepository,
             IsoMessageRepository isoMessageRepository,
-            NetworkSubmissionRepository networkSubmissionRepository) {
+            NetworkSubmissionRepository networkSubmissionRepository,
+            NetworkResponseRepository networkResponseRepository) {
 
         this.ledgerRepository = ledgerRepository;
         this.historyRepository = historyRepository;
         this.isoMessageRepository = isoMessageRepository;
         this.networkSubmissionRepository = networkSubmissionRepository;
+        this.networkResponseRepository = networkResponseRepository;
     }
 
     // Retrieve one payment using UETR
     public PaymentDetailsResponse getPaymentByUetr(String uetr) {
+
+        if (uetr == null || uetr.isBlank()) {
+            throw new IllegalArgumentException("UETR cannot be empty.");
+        }
 
         TransactionLedger payment = ledgerRepository.findById(uetr)
                 .orElseThrow(() -> new IllegalArgumentException(
@@ -113,16 +125,46 @@ public class PaymentTrackingService {
                         "Payment not found for UETR: " + uetr
                 ));
 
-        // 2. Retrieve network submission evidence
-        List<NetworkSubmissionResponse> networkSubmissions =
+        // 2. Retrieve network submissions
+        List<NetworkSubmission> submissions =
                 networkSubmissionRepository
-                        .findByTransactionLedger_UetrOrderBySubmittedAtAsc(uetr)
-                        .stream()
+                        .findByTransactionLedger_UetrOrderBySubmittedAtAsc(uetr);
+
+        // 3. Retrieve delayed responses in one database query
+        List<Long> submissionIds = submissions.stream()
+                .map(NetworkSubmission::getId)
+                .toList();
+
+        Map<Long, NetworkResponseApiResponse> delayedResponses;
+
+        if (submissionIds.isEmpty()) {
+            delayedResponses = Map.of();
+        } else {
+            delayedResponses = networkResponseRepository
+                    .findByNetworkSubmission_IdIn(submissionIds)
+                    .stream()
+                    .collect(Collectors.toMap(
+                            response ->
+                                    response.getNetworkSubmission().getId(),
+                            response -> NetworkResponseApiResponse.from(
+                                    response,
+                                    response.getNetworkSubmission().getId()
+                            )
+                    ));
+        }
+
+        // 4. Combine original submissions with their delayed responses
+        List<NetworkSubmissionResponse> networkSubmissions =
+                submissions.stream()
                         .map(submission ->
-                                NetworkSubmissionResponse.from(submission, uetr))
+                                NetworkSubmissionResponse.from(
+                                        submission,
+                                        uetr,
+                                        delayedResponses.get(submission.getId())
+                                ))
                         .toList();
 
-        // 3. Retrieve ISO 20022 messages
+        // 5. Retrieve ISO 20022 messages
         List<IsoMessageResponse> isoMessages =
                 isoMessageRepository
                         .findByTransactionLedger_UetrOrderByCreatedAtAsc(uetr)
@@ -130,14 +172,14 @@ public class PaymentTrackingService {
                         .map(this::mapToIsoMessageResponse)
                         .toList();
 
-        // 4. Retrieve complete status history
+        // 6. Retrieve complete status history
         List<PaymentHistoryResponse> statusHistory =
                 historyRepository.findByUetrOrderByChangedAtAsc(uetr)
                         .stream()
                         .map(PaymentHistoryResponse::from)
                         .toList();
 
-        // Combine all information into one response
+        // Combine all tracking information
         return new PaymentTrackingResponse(
                 mapToResponse(payment),
                 networkSubmissions,

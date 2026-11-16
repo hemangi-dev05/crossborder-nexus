@@ -37,13 +37,17 @@ class PaymentRoutingServiceTest {
         PaymentRoutingProperties.Corridor germanyUs = createCorridor(
                 "DE", "US", "USD", "CROSS_BORDER_CORRESPONDENT", true);
 
+        PaymentRoutingProperties.Corridor indiaNepal = createCorridor(
+                "IN", "NP", "INR", "CROSS_BORDER_CORRESPONDENT", true);
+
         properties.setCorridors(List.of(
                 indiaIndia,
                 indiaUs,
                 indiaUk,
                 indiaSingapore,
                 usUk,
-                germanyUs
+                germanyUs,
+                indiaNepal
         ));
 
         routingService = new PaymentRoutingService(properties);
@@ -98,6 +102,14 @@ class PaymentRoutingServiceTest {
     }
 
     @Test
+    void shouldRouteIndiaToNepalPayment() {
+        assertEquals(
+                "CROSS_BORDER_CORRESPONDENT",
+                routingService.determineRoute("IN", "NP", "INR")
+        );
+    }
+
+    @Test
     void shouldRejectUnsupportedCorridor() {
         assertThrows(
                 UnsupportedCorridorException.class,
@@ -133,6 +145,22 @@ class PaymentRoutingServiceTest {
         );
     }
 
+    @Test
+    void shouldRejectNullCountryCode() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> routingService.determineRoute(null, "US", "USD")
+        );
+    }
+
+    @Test
+    void shouldRejectBlankSettlementCurrency() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> routingService.determineRoute("IN", "US", " ")
+        );
+    }
+
     private PaymentRoutingProperties.Corridor createCorridor(
             String debtorCountry,
             String creditorCountry,
@@ -152,3 +180,4 @@ class PaymentRoutingServiceTest {
         return corridor;
     }
 }
+
