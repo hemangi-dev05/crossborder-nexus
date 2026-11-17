@@ -1,4 +1,3 @@
-
 package com.fintech.controltower.domain.entity;
 
 import jakarta.persistence.*;
@@ -9,8 +8,8 @@ import java.time.LocalDateTime;
         name = "payment_idempotency",
         uniqueConstraints = {
                 @UniqueConstraint(
-                        name = "uk_payment_idempotency_key",
-                        columnNames = "idempotency_key"
+                        name = "uk_payment_customer_idempotency",
+                        columnNames = {"customer_id", "idempotency_key"}
                 )
         }
 )
@@ -28,6 +27,9 @@ public class IdempotencyRecord {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Column(name = "customer_id", nullable = false)
+    private Long customerId;
 
     @Column(
             name = "idempotency_key",
@@ -63,10 +65,12 @@ public class IdempotencyRecord {
     }
 
     public IdempotencyRecord(
+            Long customerId,
             String idempotencyKey,
             String requestHash,
             String uetr
     ) {
+        this.customerId = customerId;
         this.idempotencyKey = idempotencyKey;
         this.requestHash = requestHash;
         this.uetr = uetr;
@@ -87,6 +91,10 @@ public class IdempotencyRecord {
 
     public Long getId() {
         return id;
+    }
+
+    public Long getCustomerId() {
+        return customerId;
     }
 
     public String getIdempotencyKey() {

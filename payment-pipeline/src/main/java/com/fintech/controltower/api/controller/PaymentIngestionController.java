@@ -106,7 +106,7 @@ public class PaymentIngestionController {
                             request.accountId(),
                             customer.getId()
                     )
-                    .orElseThrow(() -> new AccountNotFoundException());
+                    .orElseThrow(AccountNotFoundException::new);
 
             if (account.getStatus()
                     != CustomerAccount.AccountStatus.ACTIVE) {
@@ -122,8 +122,11 @@ public class PaymentIngestionController {
                     account
             );
 
+            // Customer-scoped idempotency:
+            // the same key can be used independently by different customers.
             PaymentResult result =
                     paymentIdempotencyService.processPayment(
+                            customer.getId(),
                             idempotencyKey,
                             paymentRequest
                     );

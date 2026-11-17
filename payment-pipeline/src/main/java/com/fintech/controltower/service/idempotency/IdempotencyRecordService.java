@@ -1,4 +1,3 @@
-
 package com.fintech.controltower.service.idempotency;
 
 import com.fintech.controltower.domain.entity.IdempotencyRecord;
@@ -27,15 +26,17 @@ public class IdempotencyRecordService {
             IdempotencyRecord record
     ) {}
 
-    // Reserve and commit the key and UETR independently.
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Reservation reserve(
+            Long customerId,
             String idempotencyKey,
             String requestHash
     ) {
-
         Optional<IdempotencyRecord> existing =
-                repository.findByIdempotencyKey(idempotencyKey);
+                repository.findByCustomerIdAndIdempotencyKey(
+                        customerId,
+                        idempotencyKey
+                );
 
         if (existing.isPresent()) {
             return new Reservation(false, existing.get());
@@ -43,12 +44,12 @@ public class IdempotencyRecordService {
 
         String uetr = UUID.randomUUID().toString();
 
-        IdempotencyRecord newRecord =
-                new IdempotencyRecord(
-                        idempotencyKey,
-                        requestHash,
-                        uetr
-                );
+        IdempotencyRecord newRecord = new IdempotencyRecord(
+                customerId,
+                idempotencyKey,
+                requestHash,
+                uetr
+        );
 
         IdempotencyRecord saved =
                 repository.saveAndFlush(newRecord);
@@ -56,36 +57,39 @@ public class IdempotencyRecordService {
         return new Reservation(true, saved);
     }
 
-    // Acquire the lock inside the caller's active transaction.
     @Transactional(propagation = Propagation.MANDATORY)
     public Optional<IdempotencyRecord> lockByKey(
+            Long customerId,
             String idempotencyKey
     ) {
-        return repository.findByIdempotencyKeyForUpdate(
+        return repository.findByCustomerIdAndIdempotencyKeyForUpdate(
+                customerId,
                 idempotencyKey
         );
     }
 
-    // Retain this method for non-locking lookups.
     @Transactional(
             propagation = Propagation.REQUIRES_NEW,
             readOnly = true
     )
     public Optional<IdempotencyRecord> findByKey(
+            Long customerId,
             String idempotencyKey
     ) {
-        return repository.findByIdempotencyKey(idempotencyKey);
+        return repository.findByCustomerIdAndIdempotencyKey(
+                customerId,
+                idempotencyKey
+        );
     }
 
-    // Complete and commit the final state independently.
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void complete(
+            Long customerId,
             String idempotencyKey,
             IdempotencyRecord.ProcessingState state,
             String uetr,
             String responseMessage
     ) {
-
         if (state == null
                 || state == IdempotencyRecord.ProcessingState.IN_PROGRESS) {
 
@@ -95,10 +99,12 @@ public class IdempotencyRecordService {
         }
 
         IdempotencyRecord record =
-                repository.findByIdempotencyKey(idempotencyKey)
-                        .orElseThrow(() -> new IllegalStateException(
-                                "Idempotency record not found"
-                        ));
+                repository.findByCustomerIdAndIdempotencyKeyForUpdate(
+                        customerId,
+                        idempotencyKey
+                ).orElseThrow(() -> new IllegalStateException(
+                        "Idempotency record not found for customer"
+                ));
 
         if (record.getState()
                 != IdempotencyRecord.ProcessingState.IN_PROGRESS) {

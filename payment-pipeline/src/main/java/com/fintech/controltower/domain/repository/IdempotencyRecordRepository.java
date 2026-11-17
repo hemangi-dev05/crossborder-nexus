@@ -1,4 +1,3 @@
-
 package com.fintech.controltower.domain.repository;
 
 import com.fintech.controltower.domain.entity.IdempotencyRecord;
@@ -15,7 +14,8 @@ import java.util.Optional;
 public interface IdempotencyRecordRepository
         extends JpaRepository<IdempotencyRecord, Long> {
 
-    Optional<IdempotencyRecord> findByIdempotencyKey(
+    Optional<IdempotencyRecord> findByCustomerIdAndIdempotencyKey(
+            Long customerId,
             String idempotencyKey
     );
 
@@ -23,9 +23,11 @@ public interface IdempotencyRecordRepository
     @Query("""
             SELECT record
             FROM IdempotencyRecord record
-            WHERE record.idempotencyKey = :idempotencyKey
+            WHERE record.customerId = :customerId
+              AND record.idempotencyKey = :idempotencyKey
             """)
-    Optional<IdempotencyRecord> findByIdempotencyKeyForUpdate(
+    Optional<IdempotencyRecord> findByCustomerIdAndIdempotencyKeyForUpdate(
+            @Param("customerId") Long customerId,
             @Param("idempotencyKey") String idempotencyKey
     );
 }

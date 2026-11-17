@@ -1,18 +1,17 @@
 
 package com.fintech.controltower.service.idempotency;
 
-import com.fintech.controltower.service.payment.PaymentSagaResult;
-
-import com.fintech.controltower.service.payment.PaymentSagaOrchestrator;
-
 import com.fintech.controltower.domain.entity.IdempotencyRecord;
 import com.fintech.controltower.domain.model.PaymentRequest;
 import com.fintech.controltower.exception.AmlHoldException;
 import com.fintech.controltower.exception.IdempotencyConflictException;
 import com.fintech.controltower.exception.UnsupportedCorridorException;
+import com.fintech.controltower.service.payment.PaymentSagaOrchestrator;
+import com.fintech.controltower.service.payment.PaymentSagaResult;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
@@ -39,37 +38,72 @@ public class PaymentIdempotencyService {
     }
 
     public record PaymentResult(
-            IdempotencyRecord.ProcessingState state,
+            ProcessingState state,
             String uetr,
             String message,
             boolean replayed
     ) {}
 
+    public enum ProcessingState {
+        IN_PROGRESS,
+        ACCEPTED,
+        NETWORK_PENDING,
+        AML_HOLD,
+        REJECTED,
+        FAILED
+    }
+
     public PaymentResult processPayment(
+            Long customerId,
             String idempotencyKey,
             PaymentRequest request
     ) {
 
-        validateKey(idempotencyKey);
+        if (customerId == null) {
+            throw new IllegalArgumentException(
+                    "Customer ID is required"
+            );
+        }
+
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new IllegalArgumentException(
+                    "Idempotency-Key header is required"
+            );
+        }
+
+        if (idempotencyKey.length() > 128) {
+            throw new IllegalArgumentException(
+                    "Idempotency-Key must not exceed 128 characters"
+            );
+        }
+
+        if (request == null) {
+            throw new IllegalArgumentException(
+                    "Payment request is required"
+            );
+        }
 
         String requestHash =
                 fingerprintService.generateFingerprint(request);
 
         IdempotencyRecordService.Reservation reservation;
 
-        // 1. Reserve the idempotency key.
         try {
-
             reservation = recordService.reserve(
+                    customerId,
                     idempotencyKey,
                     requestHash
             );
 
         } catch (DataIntegrityViolationException exception) {
 
-            // Another concurrent request may have reserved this key.
+            // Another concurrent request may have inserted
+            // the same customer's idempotency key.
             Optional<IdempotencyRecord> existing =
-                    recordService.findByKey(idempotencyKey);
+                    recordService.findByKey(
+                            customerId,
+                            idempotencyKey
+                    );
 
             if (existing.isEmpty()) {
                 throw exception;
@@ -83,45 +117,46 @@ public class PaymentIdempotencyService {
 
         IdempotencyRecord record = reservation.record();
 
-        // 2. Handle an existing idempotency record.
+        if (record == null) {
+            throw new IllegalStateException(
+                    "Idempotency reservation returned no record"
+            );
+        }
+
+        // Same key with a different payment request is not allowed.
+        if (!record.getRequestHash().equals(requestHash)) {
+            throw new IdempotencyConflictException(
+                    "Idempotency key has already been used for a different payment request"
+            );
+        }
+
+        // Existing request: never execute the payment again.
         if (!reservation.created()) {
-
-            if (!requestHash.equals(record.getRequestHash())) {
-
-                throw new IdempotencyConflictException(
-                        "This Idempotency-Key has already been used "
-                                + "with different payment details."
-                );
-            }
 
             if (record.getState()
                     == IdempotencyRecord.ProcessingState.IN_PROGRESS) {
 
                 throw new IdempotencyConflictException(
-                        "A payment with this Idempotency-Key "
-                                + "is already being processed."
+                        "A payment with this idempotency key is already being processed"
                 );
             }
 
-            // Replay the previously stored result.
             return new PaymentResult(
-                    record.getState(),
+                    ProcessingState.valueOf(record.getState().name()),
                     record.getUetr(),
                     record.getResponseMessage(),
                     true
             );
         }
 
-        // 3. Use the UETR reserved before saga execution.
         String uetr = record.getUetr();
 
         if (uetr == null || uetr.isBlank()) {
             throw new IllegalStateException(
-                    "Reserved idempotency record does not contain a UETR"
+                    "Idempotency record does not contain a UETR"
             );
         }
 
-        // 4. Execute the payment saga.
         PaymentSagaResult sagaResult;
 
         try {
@@ -133,115 +168,87 @@ public class PaymentIdempotencyService {
 
         } catch (AmlHoldException exception) {
 
-            // AML ledger and history are already persisted by the saga.
-            String message = exception.getMessage();
-
             recordService.complete(
+                    customerId,
                     idempotencyKey,
                     IdempotencyRecord.ProcessingState.AML_HOLD,
                     uetr,
-                    message
+                    exception.getMessage()
             );
 
             return new PaymentResult(
-                    IdempotencyRecord.ProcessingState.AML_HOLD,
+                    ProcessingState.AML_HOLD,
                     uetr,
-                    message,
+                    exception.getMessage(),
                     false
             );
 
         } catch (UnsupportedCorridorException exception) {
 
-            // The saga transaction rolls back for unsupported corridors.
-            // Persist the business rejection independently.
-            String message = exception.getMessage();
-
             log.warn(
-                    "Payment rejected because the corridor is unsupported. UETR: {}",
-                    uetr
+                    "Unsupported payment corridor for UETR {}: {}",
+                    uetr,
+                    exception.getMessage()
             );
 
             recordService.complete(
+                    customerId,
                     idempotencyKey,
                     IdempotencyRecord.ProcessingState.REJECTED,
                     uetr,
-                    message
+                    exception.getMessage()
             );
 
             return new PaymentResult(
-                    IdempotencyRecord.ProcessingState.REJECTED,
+                    ProcessingState.REJECTED,
                     uetr,
-                    message,
+                    exception.getMessage(),
                     false
             );
 
         } catch (RuntimeException exception) {
 
             log.error(
-                    "Payment saga failed for idempotency key",
+                    "Payment saga failed for UETR {}",
+                    uetr,
                     exception
             );
 
-            String message =
-                    "Payment processing failed. Please contact support.";
-
             recordService.complete(
+                    customerId,
                     idempotencyKey,
                     IdempotencyRecord.ProcessingState.FAILED,
                     uetr,
-                    message
+                    "Payment processing failed"
             );
 
-            return new PaymentResult(
-                    IdempotencyRecord.ProcessingState.FAILED,
-                    uetr,
-                    message,
-                    false
-            );
+            throw exception;
         }
 
-        // 5. Map the saga outcome to the idempotency state.
-        IdempotencyRecord.ProcessingState finalState =
-                switch (sagaResult.outcome()) {
+        ProcessingState resultState = switch (sagaResult.outcome()) {
+            case ACKNOWLEDGED -> ProcessingState.ACCEPTED;
+            case REJECTED -> ProcessingState.REJECTED;
+            case NETWORK_PENDING -> ProcessingState.NETWORK_PENDING;
+        };
 
-                    case ACKNOWLEDGED ->
-                            IdempotencyRecord.ProcessingState.ACCEPTED;
-
-                    case REJECTED ->
-                            IdempotencyRecord.ProcessingState.REJECTED;
-
-                    case NETWORK_PENDING ->
-                            IdempotencyRecord.ProcessingState.NETWORK_PENDING;
-                };
-
-        // 6. Persist the outcome for future idempotent replays.
-        String message = sagaResult.message();
+        IdempotencyRecord.ProcessingState recordState =
+                IdempotencyRecord.ProcessingState.valueOf(
+                        resultState.name()
+                );
 
         recordService.complete(
+                customerId,
                 idempotencyKey,
-                finalState,
+                recordState,
                 uetr,
-                message
+                sagaResult.message()
         );
 
         return new PaymentResult(
-                finalState,
+                resultState,
                 uetr,
-                message,
+                sagaResult.message(),
                 false
         );
-    }
-
-    private void validateKey(String idempotencyKey) {
-
-        if (idempotencyKey == null
-                || idempotencyKey.isBlank()
-                || idempotencyKey.length() > 128) {
-
-            throw new IllegalArgumentException(
-                    "Idempotency-Key must contain between "
-                            + "1 and 128 characters."
-            );
-        }
     }
 }
