@@ -1,3 +1,4 @@
+
 package com.fintech.controltower.api.dto;
 
 import com.fintech.controltower.domain.entity.NetworkSubmission;
@@ -12,12 +13,14 @@ public record NetworkSubmissionResponse(
         NetworkSubmission.SubmissionStatus status,
         LocalDateTime submittedAt,
         LocalDateTime respondedAt,
-        String responseMessage
+        String responseMessage,
+        NetworkResponseApiResponse delayedResponse
 ) {
 
     public static NetworkSubmissionResponse from(
             NetworkSubmission submission,
-            String uetr
+            String uetr,
+            NetworkResponseApiResponse delayedResponse
     ) {
         return new NetworkSubmissionResponse(
                 submission.getId(),
@@ -27,7 +30,8 @@ public record NetworkSubmissionResponse(
                 submission.getStatus(),
                 submission.getSubmittedAt(),
                 submission.getRespondedAt(),
-                submission.getResponseMessage()
+                submission.getResponseMessage(),
+                delayedResponse
         );
     }
 }

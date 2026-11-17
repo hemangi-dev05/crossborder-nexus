@@ -24,20 +24,33 @@ import com.fintech.controltower.service.network.NetworkAdapterRegistry;
 import com.fintech.controltower.service.network.NetworkSubmissionResult;
 import com.fintech.controltower.service.network.PaymentNetworkAdapter;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 public class PaymentSagaOrchestrator {
+
+    private static final Logger log =
+            LoggerFactory.getLogger(PaymentSagaOrchestrator.class);
 
     private final TransactionLedgerRepository ledgerRepository;
     private final PaymentStatusHistoryRepository historyRepository;
     private final IsoMessageRepository isoMessageRepository;
     private final NetworkSubmissionRepository networkSubmissionRepository;
+
     private final AmlScreeningService amlScreeningService;
     private final FinancialCalculationService financialCalculationService;
     private final NetworkAdapterRegistry networkAdapterRegistry;
     private final TransactionStatusService transactionStatusService;
+
+    private final TransactionTemplate transactionTemplate;
 
     public PaymentSagaOrchestrator(
             TransactionLedgerRepository ledgerRepository,
@@ -47,7 +60,8 @@ public class PaymentSagaOrchestrator {
             AmlScreeningService amlScreeningService,
             FinancialCalculationService financialCalculationService,
             NetworkAdapterRegistry networkAdapterRegistry,
-            TransactionStatusService transactionStatusService
+            TransactionStatusService transactionStatusService,
+            PlatformTransactionManager transactionManager
     ) {
         this.ledgerRepository = ledgerRepository;
         this.historyRepository = historyRepository;
@@ -57,15 +71,26 @@ public class PaymentSagaOrchestrator {
         this.financialCalculationService = financialCalculationService;
         this.networkAdapterRegistry = networkAdapterRegistry;
         this.transactionStatusService = transactionStatusService;
+
+        this.transactionTemplate =
+                new TransactionTemplate(transactionManager);
+
+        this.transactionTemplate.setPropagationBehavior(
+                TransactionDefinition.PROPAGATION_REQUIRES_NEW
+        );
     }
 
-    @Transactional(noRollbackFor = SecurityException.class)
+    /*
+     * The orchestrator itself must not hold a database transaction.
+     * Each local persistence operation starts its own transaction.
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public PaymentSagaResult executePaymentSaga(
             PaymentRequest request,
             String uetr
     ) {
 
-        // 1. Calculate the financial instruction exactly once.
+        // 1. Calculate the financial instruction outside a DB transaction.
         PaymentCalculationRequest calculationRequest =
                 new PaymentCalculationRequest(
                         request.debtorCountryCode(),
@@ -79,13 +104,132 @@ public class PaymentSagaOrchestrator {
         PaymentCalculationResult calculation =
                 financialCalculationService.calculate(calculationRequest);
 
-        // 2. Initialize the transaction ledger.
+        // 2. Perform AML screening outside a DB transaction.
+        AmlScreeningService.AmlScreeningResult screeningResult =
+                amlScreeningService.screenTransaction(request);
+
+        if (screeningResult == null) {
+            throw new IllegalStateException(
+                    "AML screening returned no result."
+            );
+        }
+
+        String routeType = calculation.routeType();
+
+        // Resolve the adapter before accepting the payment.
+        PaymentNetworkAdapter adapter = null;
+
+        if (!screeningResult.hold()) {
+            adapter = networkAdapterRegistry.getAdapter(routeType);
+        }
+
+        // 3. Transaction 1: persist the initial payment atomically.
+        final PaymentNetworkAdapter selectedAdapter = adapter;
+
+        transactionTemplate.executeWithoutResult(transactionStatus ->
+                persistInitialPayment(
+                        request,
+                        uetr,
+                        calculation,
+                        screeningResult
+                )
+        );
+
+        // The AML hold is committed before this exception is thrown.
+        if (screeningResult.hold()) {
+            throw new AmlHoldException(
+                    uetr,
+                    screeningResult.reason()
+            );
+        }
+
+        // 4. Network submission occurs OUTSIDE a database transaction.
+        NetworkSubmissionResult submissionResult;
+
+        try {
+
+            submissionResult = selectedAdapter.submit(
+                    request,
+                    calculation,
+                    uetr
+            );
+
+            validateSubmissionResult(
+                    routeType,
+                    submissionResult
+            );
+
+        } catch (RuntimeException exception) {
+
+            log.error(
+                    "Network submission outcome is uncertain. UETR: {}",
+                    uetr,
+                    exception
+            );
+
+            return markNetworkPending(
+                    uetr,
+                    "Network submission outcome is unknown. "
+                            + "Manual reconciliation is required.",
+                    "Network submission could not be confirmed. "
+                            + "Payment is awaiting reconciliation. UETR: "
+                            + uetr,
+                    exception
+            );
+        }
+
+        // 5. Transaction 2: persist network evidence and status atomically.
+        try {
+
+            transactionTemplate.executeWithoutResult(transactionStatus ->
+                    persistNetworkOutcome(
+                            uetr,
+                            routeType,
+                            submissionResult
+                    )
+            );
+
+        } catch (RuntimeException exception) {
+
+            log.error(
+                    "Network response was received but could not be "
+                            + "persisted. UETR: {}",
+                    uetr,
+                    exception
+            );
+
+            return markNetworkPending(
+                    uetr,
+                    "Network response was received but could not be "
+                            + "persisted. Manual reconciliation is required.",
+                    "Network response could not be fully persisted. "
+                            + "Payment is awaiting reconciliation. UETR: "
+                            + uetr,
+                    exception
+            );
+        }
+
+        // 6. Return the outcome after the persistence transaction commits.
+        return createSagaResult(uetr, submissionResult);
+    }
+
+    /*
+     * Transaction 1:
+     * Create the ledger and its initial history together.
+     */
+    private void persistInitialPayment(
+            PaymentRequest request,
+            String uetr,
+            PaymentCalculationResult calculation,
+            AmlScreeningService.AmlScreeningResult screeningResult
+    ) {
+
         TransactionLedger ledger = new TransactionLedger();
 
         ledger.setUetr(uetr);
         ledger.setTransactionId(request.transactionId());
 
-        // 3. Map sender details.
+        // Sender details
         ledger.setDebtorName(request.debtorName());
         ledger.setDebtorAccountNumber(request.debtorAccountNumber());
         ledger.setDebtorBic(request.debtorBic());
@@ -97,7 +241,7 @@ public class PaymentSagaOrchestrator {
                 request.debtorClearingMemberId()
         );
 
-        // 4. Map beneficiary details.
+        // Beneficiary details
         ledger.setCreditorName(request.creditorName());
         ledger.setCreditorAccountNumber(request.creditorAccountNumber());
         ledger.setCreditorBic(request.creditorBic());
@@ -109,8 +253,7 @@ public class PaymentSagaOrchestrator {
                 request.creditorClearingMemberId()
         );
 
-        // 5. Persist the calculated financial instruction.
-        // amount and currency represent source principal and source currency.
+        // Calculated financial instruction
         ledger.setAmount(calculation.sourcePrincipal());
         ledger.setCurrency(calculation.sourceCurrency());
 
@@ -122,95 +265,110 @@ public class PaymentSagaOrchestrator {
         ledger.setFeeCurrency(calculation.feeCurrency());
         ledger.setTotalSenderDebit(calculation.totalSenderDebit());
 
-        // 6. Perform AML screening.
-        AmlScreeningService.AmlScreeningResult screeningResult =
-                amlScreeningService.screenTransaction(request);
+        TransactionLedger.TransactionStatus initialStatus;
+        String historyReason;
 
         if (screeningResult.hold()) {
 
-            ledger.setStatus(
-                    TransactionLedger.TransactionStatus.SUSPENDED_AML_HOLD
-            );
+            initialStatus =
+                    TransactionLedger.TransactionStatus.SUSPENDED_AML_HOLD;
 
-            ledgerRepository.save(ledger);
+            historyReason = screeningResult.reason();
 
-            PaymentStatusHistory history = new PaymentStatusHistory(
-                    uetr,
-                    null,
-                    TransactionLedger.TransactionStatus.SUSPENDED_AML_HOLD,
-                    screeningResult.reason()
-            );
+        } else {
 
-            historyRepository.save(history);
+            initialStatus =
+                    TransactionLedger.TransactionStatus.ACCEPTED;
 
-            throw new AmlHoldException(
-                    uetr,
-                    screeningResult.reason()
-            );
+            historyReason =
+                    "Payment accepted after successful AML screening";
         }
 
-        // 7. Use the route determined during financial calculation.
-        String routeType = calculation.routeType();
-
-        // 8. Mark the payment as accepted by our platform.
-        ledger.setStatus(
-                TransactionLedger.TransactionStatus.ACCEPTED
-        );
+        ledger.setStatus(initialStatus);
 
         ledgerRepository.save(ledger);
 
-        PaymentStatusHistory initialHistory = new PaymentStatusHistory(
-                uetr,
-                null,
-                TransactionLedger.TransactionStatus.ACCEPTED,
-                "Payment accepted after successful AML screening"
+        historyRepository.save(
+                new PaymentStatusHistory(
+                        uetr,
+                        null,
+                        initialStatus,
+                        historyReason
+                )
         );
+    }
 
-        historyRepository.save(initialHistory);
+    /*
+     * Validate the adapter response before persisting it.
+     */
+    private void validateSubmissionResult(
+            String expectedRoute,
+            NetworkSubmissionResult result
+    ) {
 
-        // 9. Find the adapter responsible for this route.
-        PaymentNetworkAdapter adapter =
-                networkAdapterRegistry.getAdapter(routeType);
-
-        // 10. Submit the original request with the same calculated result.
-        NetworkSubmissionResult submissionResult =
-                adapter.submit(request, calculation, uetr);
-
-        if (submissionResult == null) {
+        if (result == null) {
             throw new IllegalStateException(
                     "Network adapter returned no submission result."
             );
         }
 
-        if (!routeType.equals(submissionResult.routeType())) {
+        if (!expectedRoute.equals(result.routeType())) {
             throw new IllegalStateException(
                     "Network adapter returned an unexpected route type."
             );
         }
 
-        if (submissionResult.status() == null) {
+        if (result.status() == null) {
             throw new IllegalStateException(
                     "Network adapter returned no submission status."
             );
         }
 
-        // 11. Persist network submission evidence.
-        NetworkSubmission networkSubmission = new NetworkSubmission(
-                ledger,
-                submissionResult.routeType(),
-                submissionResult.networkReference(),
-                NetworkSubmission.SubmissionStatus.valueOf(
-                        submissionResult.status().name()
-                ),
-                submissionResult.submittedAt(),
-                submissionResult.respondedAt(),
-                submissionResult.responseMessage()
-        );
+        if ("CROSS_BORDER_CORRESPONDENT".equals(expectedRoute)
+                && (result.isoXmlMessage() == null
+                || result.isoXmlMessage().isBlank())) {
+
+            throw new IllegalStateException(
+                    "Cross-border adapter did not return an ISO 20022 message."
+            );
+        }
+    }
+
+    /*
+     * Transaction 2:
+     * Persist the network submission, ISO message, payment status
+     * and status history as one atomic operation.
+     */
+    private void persistNetworkOutcome(
+            String uetr,
+            String routeType,
+            NetworkSubmissionResult result
+    ) {
+
+        TransactionLedger ledger =
+                ledgerRepository.findByUetrForUpdate(uetr)
+                        .orElseThrow(() ->
+                                new IllegalArgumentException(
+                                        "Payment not found for UETR: " + uetr
+                                )
+                        );
+
+        NetworkSubmission networkSubmission =
+                new NetworkSubmission(
+                        ledger,
+                        result.routeType(),
+                        result.networkReference(),
+                        NetworkSubmission.SubmissionStatus.valueOf(
+                                result.status().name()
+                        ),
+                        result.submittedAt(),
+                        result.respondedAt(),
+                        result.responseMessage()
+                );
 
         networkSubmissionRepository.save(networkSubmission);
 
-        // 12. Persist the ISO message whenever the adapter generated one.
-        String isoXmlMessage = submissionResult.isoXmlMessage();
+        String isoXmlMessage = result.isoXmlMessage();
 
         if (isoXmlMessage != null && !isoXmlMessage.isBlank()) {
 
@@ -225,105 +383,138 @@ public class PaymentSagaOrchestrator {
             isoMessageRepository.save(isoMessage);
         }
 
-        // Cross-border submissions must contain their ISO message.
-        if ("CROSS_BORDER_CORRESPONDENT".equals(routeType)
-                && (isoXmlMessage == null || isoXmlMessage.isBlank())) {
+        TransactionLedger.TransactionStatus newStatus;
+        String reason;
 
-            throw new IllegalStateException(
-                    "Cross-border adapter did not return an ISO 20022 message."
-            );
-        }
-
-        // 13. Handle all expected simulated network outcomes.
-        switch (submissionResult.status()) {
+        switch (result.status()) {
 
             case SIMULATED_ACKNOWLEDGED -> {
 
-                String reason =
+                newStatus =
+                        TransactionLedger.TransactionStatus.PROCESSING;
+
+                reason =
                         "Simulated network acknowledged the payment instruction. "
                                 + "Network reference: "
-                                + submissionResult.networkReference();
+                                + result.networkReference();
+            }
 
-                transactionStatusService.updateStatus(
-                        uetr,
-                        TransactionLedger.TransactionStatus.PROCESSING,
-                        reason
-                );
+            case SIMULATED_NACK -> {
 
-                System.out.println(
-                        "Simulated network acknowledged payment. "
-                                + "UETR: " + uetr
-                );
+                newStatus =
+                        TransactionLedger.TransactionStatus.REJECTED;
 
-                return new PaymentSagaResult(
+                reason =
+                        "Simulated network rejected the payment instruction. "
+                                + "Network reference: "
+                                + result.networkReference();
+            }
+
+            case SIMULATED_TIMEOUT -> {
+
+                newStatus =
+                        TransactionLedger.TransactionStatus.NETWORK_PENDING;
+
+                reason =
+                        "No simulated network response was received. "
+                                + "Payment is awaiting confirmation. "
+                                + "Network reference: "
+                                + result.networkReference();
+            }
+
+            default -> throw new IllegalStateException(
+                    "Unsupported network submission status."
+            );
+        }
+
+        // Joins Transaction 2 because TransactionStatusService
+        // uses Spring's default REQUIRED propagation.
+        transactionStatusService.updateStatus(
+                uetr,
+                newStatus,
+                reason
+        );
+    }
+
+    /*
+     * If the network outcome is uncertain, preserve the payment
+     * as NETWORK_PENDING rather than incorrectly marking it FAILED.
+     */
+    private PaymentSagaResult markNetworkPending(
+            String uetr,
+            String reason,
+            String message,
+            RuntimeException originalException
+    ) {
+
+        try {
+
+            transactionTemplate.executeWithoutResult(transactionStatus ->
+                    transactionStatusService.updateStatus(
+                            uetr,
+                            TransactionLedger.TransactionStatus.NETWORK_PENDING,
+                            reason
+                    )
+            );
+
+        } catch (RuntimeException recoveryException) {
+
+            originalException.addSuppressed(recoveryException);
+            throw originalException;
+        }
+
+        return new PaymentSagaResult(
+                PaymentSagaResult.Outcome.NETWORK_PENDING,
+                message
+        );
+    }
+
+    private PaymentSagaResult createSagaResult(
+            String uetr,
+            NetworkSubmissionResult result
+    ) {
+
+        return switch (result.status()) {
+
+            case SIMULATED_ACKNOWLEDGED -> {
+
+                log.info("Network acknowledged payment. UETR: {}", uetr);
+
+                yield new PaymentSagaResult(
                         PaymentSagaResult.Outcome.ACKNOWLEDGED,
                         "Payment accepted for simulated processing. "
                                 + "UETR: " + uetr
                                 + ". Network reference: "
-                                + submissionResult.networkReference()
+                                + result.networkReference()
                 );
             }
 
             case SIMULATED_NACK -> {
 
-                String reason =
-                        "Simulated network rejected the payment instruction. "
-                                + "Network reference: "
-                                + submissionResult.networkReference();
+                log.info("Network rejected payment. UETR: {}", uetr);
 
-                transactionStatusService.updateStatus(
-                        uetr,
-                        TransactionLedger.TransactionStatus.REJECTED,
-                        reason
-                );
-
-                System.out.println(
-                        "Simulated network rejected payment. "
-                                + "UETR: " + uetr
-                );
-
-                return new PaymentSagaResult(
+                yield new PaymentSagaResult(
                         PaymentSagaResult.Outcome.REJECTED,
                         "Simulated network rejected the payment. "
                                 + "UETR: " + uetr
                                 + ". Network reference: "
-                                + submissionResult.networkReference()
+                                + result.networkReference()
                 );
             }
 
             case SIMULATED_TIMEOUT -> {
 
-                String reason =
-                        "No simulated network response was received. "
-                                + "Payment is awaiting confirmation. "
-                                + "Network reference: "
-                                + submissionResult.networkReference();
+                log.info("Network timeout. Payment pending. UETR: {}", uetr);
 
-                transactionStatusService.updateStatus(
-                        uetr,
-                        TransactionLedger.TransactionStatus.NETWORK_PENDING,
-                        reason
-                );
-
-                System.out.println(
-                        "Simulated network timed out. "
-                                + "Payment is NETWORK_PENDING. "
-                                + "UETR: " + uetr
-                );
-
-                return new PaymentSagaResult(
+                yield new PaymentSagaResult(
                         PaymentSagaResult.Outcome.NETWORK_PENDING,
                         "No simulated network response was received. "
                                 + "Payment is awaiting confirmation. "
                                 + "UETR: " + uetr
                                 + ". Network reference: "
-                                + submissionResult.networkReference()
+                                + result.networkReference()
                 );
             }
-        }
-
-        throw new IllegalStateException(
-                "Unsupported simulated network submission status."
-        );
+        };
     }
 }

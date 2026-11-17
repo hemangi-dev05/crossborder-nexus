@@ -31,9 +31,6 @@ public class RequestFingerprintService {
             DataOutputStream dataStream =
                     new DataOutputStream(byteStream);
 
-            // Transaction identifier
-            writeField(dataStream, request.transactionId());
-
             // Debtor details
             writeField(dataStream, request.debtorName());
             writeField(dataStream, request.debtorAccountNumber());

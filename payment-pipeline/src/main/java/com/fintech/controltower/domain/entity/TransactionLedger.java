@@ -2,6 +2,7 @@
 package com.fintech.controltower.domain.entity;
 
 import com.fintech.controltower.financial.model.AmountMode;
+
 import jakarta.persistence.*;
 
 import java.math.BigDecimal;
@@ -18,6 +19,13 @@ public class TransactionLedger {
         SETTLED,
         REJECTED,
         SUSPENDED_AML_HOLD
+    }
+
+    public enum FundsReservationStatus {
+        NOT_RESERVED,
+        RESERVED,
+        RELEASED,
+        DEBITED
     }
 
     @Id
@@ -77,6 +85,17 @@ public class TransactionLedger {
     @Column(precision = 19, scale = 5)
     private BigDecimal totalSenderDebit;
 
+    // Actual sender account funding this payment
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "sender_account_id")
+    private CustomerAccount senderAccount;
+
+    // Tracks whether sender funds are reserved, released or debited
+    @Enumerated(EnumType.STRING)
+    @Column(name = "funds_reservation_status", length = 20)
+    private FundsReservationStatus fundsReservationStatus =
+            FundsReservationStatus.NOT_RESERVED;
+
     // Payment lifecycle
     @Enumerated(EnumType.STRING)
     @Column(length = 30)
@@ -87,10 +106,16 @@ public class TransactionLedger {
 
     @PrePersist
     protected void onCreate() {
+
         LocalDateTime now = LocalDateTime.now();
 
         if (status == null) {
             status = TransactionStatus.ACCEPTED;
+        }
+
+        if (fundsReservationStatus == null) {
+            fundsReservationStatus =
+                    FundsReservationStatus.NOT_RESERVED;
         }
 
         if (createdAt == null) {
@@ -107,81 +132,258 @@ public class TransactionLedger {
 
     // Getters and Setters
 
-    public String getUetr() { return uetr; }
-    public void setUetr(String uetr) { this.uetr = uetr; }
+    public String getUetr() {
+        return uetr;
+    }
 
-    public String getTransactionId() { return transactionId; }
-    public void setTransactionId(String transactionId) { this.transactionId = transactionId; }
+    public void setUetr(String uetr) {
+        this.uetr = uetr;
+    }
 
-    public String getDebtorName() { return debtorName; }
-    public void setDebtorName(String debtorName) { this.debtorName = debtorName; }
+    public String getTransactionId() {
+        return transactionId;
+    }
 
-    public String getDebtorAccountNumber() { return debtorAccountNumber; }
-    public void setDebtorAccountNumber(String debtorAccountNumber) { this.debtorAccountNumber = debtorAccountNumber; }
+    public void setTransactionId(String transactionId) {
+        this.transactionId = transactionId;
+    }
 
-    public String getDebtorBic() { return debtorBic; }
-    public void setDebtorBic(String debtorBic) { this.debtorBic = debtorBic; }
+    public String getDebtorName() {
+        return debtorName;
+    }
 
-    public String getDebtorCountryCode() { return debtorCountryCode; }
-    public void setDebtorCountryCode(String debtorCountryCode) { this.debtorCountryCode = debtorCountryCode; }
+    public void setDebtorName(String debtorName) {
+        this.debtorName = debtorName;
+    }
 
-    public String getDebtorClearingSystemCode() { return debtorClearingSystemCode; }
-    public void setDebtorClearingSystemCode(String debtorClearingSystemCode) { this.debtorClearingSystemCode = debtorClearingSystemCode; }
+    public String getDebtorAccountNumber() {
+        return debtorAccountNumber;
+    }
 
-    public String getDebtorClearingMemberId() { return debtorClearingMemberId; }
-    public void setDebtorClearingMemberId(String debtorClearingMemberId) { this.debtorClearingMemberId = debtorClearingMemberId; }
+    public void setDebtorAccountNumber(String debtorAccountNumber) {
+        this.debtorAccountNumber = debtorAccountNumber;
+    }
 
-    public String getCreditorName() { return creditorName; }
-    public void setCreditorName(String creditorName) { this.creditorName = creditorName; }
+    public String getDebtorBic() {
+        return debtorBic;
+    }
 
-    public String getCreditorAccountNumber() { return creditorAccountNumber; }
-    public void setCreditorAccountNumber(String creditorAccountNumber) { this.creditorAccountNumber = creditorAccountNumber; }
+    public void setDebtorBic(String debtorBic) {
+        this.debtorBic = debtorBic;
+    }
 
-    public String getCreditorBic() { return creditorBic; }
-    public void setCreditorBic(String creditorBic) { this.creditorBic = creditorBic; }
+    public String getDebtorCountryCode() {
+        return debtorCountryCode;
+    }
 
-    public String getCreditorCountryCode() { return creditorCountryCode; }
-    public void setCreditorCountryCode(String creditorCountryCode) { this.creditorCountryCode = creditorCountryCode; }
+    public void setDebtorCountryCode(String debtorCountryCode) {
+        this.debtorCountryCode = debtorCountryCode;
+    }
 
-    public String getCreditorClearingSystemCode() { return creditorClearingSystemCode; }
-    public void setCreditorClearingSystemCode(String creditorClearingSystemCode) { this.creditorClearingSystemCode = creditorClearingSystemCode; }
+    public String getDebtorClearingSystemCode() {
+        return debtorClearingSystemCode;
+    }
 
-    public String getCreditorClearingMemberId() { return creditorClearingMemberId; }
-    public void setCreditorClearingMemberId(String creditorClearingMemberId) { this.creditorClearingMemberId = creditorClearingMemberId; }
+    public void setDebtorClearingSystemCode(String debtorClearingSystemCode) {
+        this.debtorClearingSystemCode = debtorClearingSystemCode;
+    }
 
-    public BigDecimal getAmount() { return amount; }
-    public void setAmount(BigDecimal amount) { this.amount = amount; }
+    public String getDebtorClearingMemberId() {
+        return debtorClearingMemberId;
+    }
 
-    public String getCurrency() { return currency; }
-    public void setCurrency(String currency) { this.currency = currency; }
+    public void setDebtorClearingMemberId(String debtorClearingMemberId) {
+        this.debtorClearingMemberId = debtorClearingMemberId;
+    }
 
-    public AmountMode getAmountMode() { return amountMode; }
-    public void setAmountMode(AmountMode amountMode) { this.amountMode = amountMode; }
+    public String getCreditorName() {
+        return creditorName;
+    }
 
-    public BigDecimal getDestinationAmount() { return destinationAmount; }
-    public void setDestinationAmount(BigDecimal destinationAmount) { this.destinationAmount = destinationAmount; }
+    public void setCreditorName(String creditorName) {
+        this.creditorName = creditorName;
+    }
 
-    public String getDestinationCurrency() { return destinationCurrency; }
-    public void setDestinationCurrency(String destinationCurrency) { this.destinationCurrency = destinationCurrency; }
+    public String getCreditorAccountNumber() {
+        return creditorAccountNumber;
+    }
 
-    public BigDecimal getExchangeRate() { return exchangeRate; }
-    public void setExchangeRate(BigDecimal exchangeRate) { this.exchangeRate = exchangeRate; }
+    public void setCreditorAccountNumber(String creditorAccountNumber) {
+        this.creditorAccountNumber = creditorAccountNumber;
+    }
 
-    public BigDecimal getTransferFee() { return transferFee; }
-    public void setTransferFee(BigDecimal transferFee) { this.transferFee = transferFee; }
+    public String getCreditorBic() {
+        return creditorBic;
+    }
 
-    public String getFeeCurrency() { return feeCurrency; }
-    public void setFeeCurrency(String feeCurrency) { this.feeCurrency = feeCurrency; }
+    public void setCreditorBic(String creditorBic) {
+        this.creditorBic = creditorBic;
+    }
 
-    public BigDecimal getTotalSenderDebit() { return totalSenderDebit; }
-    public void setTotalSenderDebit(BigDecimal totalSenderDebit) { this.totalSenderDebit = totalSenderDebit; }
+    public String getCreditorCountryCode() {
+        return creditorCountryCode;
+    }
 
-    public TransactionStatus getStatus() { return status; }
-    public void setStatus(TransactionStatus status) { this.status = status; }
+    public void setCreditorCountryCode(String creditorCountryCode) {
+        this.creditorCountryCode = creditorCountryCode;
+    }
 
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
+    public String getCreditorClearingSystemCode() {
+        return creditorClearingSystemCode;
+    }
 
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
+    public void setCreditorClearingSystemCode(String creditorClearingSystemCode) {
+        this.creditorClearingSystemCode = creditorClearingSystemCode;
+    }
+
+    public String getCreditorClearingMemberId() {
+        return creditorClearingMemberId;
+    }
+
+    public void setCreditorClearingMemberId(String creditorClearingMemberId) {
+        this.creditorClearingMemberId = creditorClearingMemberId;
+    }
+
+    public BigDecimal getAmount() {
+        return amount;
+    }
+
+    public void setAmount(BigDecimal amount) {
+        this.amount = amount;
+    }
+
+    public String getCurrency() {
+        return currency;
+    }
+
+    public void setCurrency(String currency) {
+        this.currency = currency;
+    }
+
+    public AmountMode getAmountMode() {
+        return amountMode;
+    }
+
+    public void setAmountMode(AmountMode amountMode) {
+        this.amountMode = amountMode;
+    }
+
+    public BigDecimal getDestinationAmount() {
+        return destinationAmount;
+    }
+
+    public void setDestinationAmount(BigDecimal destinationAmount) {
+        this.destinationAmount = destinationAmount;
+    }
+
+    public String getDestinationCurrency() {
+        return destinationCurrency;
+    }
+
+    public void setDestinationCurrency(String destinationCurrency) {
+        this.destinationCurrency = destinationCurrency;
+    }
+
+    public BigDecimal getExchangeRate() {
+        return exchangeRate;
+    }
+
+    public void setExchangeRate(BigDecimal exchangeRate) {
+        this.exchangeRate = exchangeRate;
+    }
+
+    public BigDecimal getTransferFee() {
+        return transferFee;
+    }
+
+    public void setTransferFee(BigDecimal transferFee) {
+        this.transferFee = transferFee;
+    }
+
+    public String getFeeCurrency() {
+        return feeCurrency;
+    }
+
+    public void setFeeCurrency(String feeCurrency) {
+        this.feeCurrency = feeCurrency;
+    }
+
+    public BigDecimal getTotalSenderDebit() {
+        return totalSenderDebit;
+    }
+
+    public void setTotalSenderDebit(BigDecimal totalSenderDebit) {
+        this.totalSenderDebit = totalSenderDebit;
+    }
+
+    public CustomerAccount getSenderAccount() {
+        return senderAccount;
+    }
+
+    public void setSenderAccount(CustomerAccount senderAccount) {
+        this.senderAccount = senderAccount;
+    }
+
+    public FundsReservationStatus getFundsReservationStatus() {
+        return fundsReservationStatus == null
+                ? FundsReservationStatus.NOT_RESERVED
+                : fundsReservationStatus;
+    }
+
+    public void markFundsReserved() {
+        if (getFundsReservationStatus()
+                != FundsReservationStatus.NOT_RESERVED) {
+            throw new IllegalStateException(
+                    "Funds have already been reserved or processed."
+            );
+        }
+
+        fundsReservationStatus = FundsReservationStatus.RESERVED;
+    }
+
+    public void markFundsReleased() {
+        if (getFundsReservationStatus()
+                != FundsReservationStatus.RESERVED) {
+            throw new IllegalStateException(
+                    "Only reserved funds can be released."
+            );
+        }
+
+        fundsReservationStatus = FundsReservationStatus.RELEASED;
+    }
+
+    public void markFundsDebited() {
+        if (getFundsReservationStatus()
+                != FundsReservationStatus.RESERVED) {
+            throw new IllegalStateException(
+                    "Only reserved funds can be debited."
+            );
+        }
+
+        fundsReservationStatus = FundsReservationStatus.DEBITED;
+    }
+
+    public TransactionStatus getStatus() {
+        return status;
+    }
+
+    public void setStatus(TransactionStatus status) {
+        this.status = status;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(LocalDateTime createdAt) {
+        this.createdAt = createdAt;
+    }
+
+    public LocalDateTime getUpdatedAt() {
+        return updatedAt;
+    }
+
+    public void setUpdatedAt(LocalDateTime updatedAt) {
+        this.updatedAt = updatedAt;
+    }
 }
