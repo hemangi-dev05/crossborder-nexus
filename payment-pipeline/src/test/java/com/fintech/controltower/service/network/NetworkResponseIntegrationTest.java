@@ -1,16 +1,20 @@
 
 package com.fintech.controltower.service.network;
 
-import com.fintech.controltower.service.payment.TransactionStatusService;
-
+import com.fintech.controltower.domain.entity.Customer;
+import com.fintech.controltower.domain.entity.CustomerAccount;
+import com.fintech.controltower.domain.entity.CustomerRole;
 import com.fintech.controltower.domain.entity.NetworkResponse;
-import com.fintech.controltower.domain.repository.NetworkResponseRepository;
 import com.fintech.controltower.domain.entity.NetworkSubmission;
-import com.fintech.controltower.domain.repository.NetworkSubmissionRepository;
 import com.fintech.controltower.domain.entity.PaymentStatusHistory;
-import com.fintech.controltower.domain.repository.PaymentStatusHistoryRepository;
 import com.fintech.controltower.domain.entity.TransactionLedger;
+import com.fintech.controltower.domain.repository.CustomerAccountRepository;
+import com.fintech.controltower.domain.repository.CustomerRepository;
+import com.fintech.controltower.domain.repository.NetworkResponseRepository;
+import com.fintech.controltower.domain.repository.NetworkSubmissionRepository;
+import com.fintech.controltower.domain.repository.PaymentStatusHistoryRepository;
 import com.fintech.controltower.domain.repository.TransactionLedgerRepository;
+import com.fintech.controltower.service.payment.TransactionStatusService;
 
 import jakarta.persistence.EntityManager;
 
@@ -43,6 +47,9 @@ class NetworkResponseIntegrationTest {
     private NetworkResponseService networkResponseService;
 
     @Autowired
+    private TransactionStatusService transactionStatusService;
+
+    @Autowired
     private TransactionLedgerRepository ledgerRepository;
 
     @Autowired
@@ -50,6 +57,12 @@ class NetworkResponseIntegrationTest {
 
     @Autowired
     private NetworkResponseRepository responseRepository;
+
+    @Autowired
+    private CustomerRepository customerRepository;
+
+    @Autowired
+    private CustomerAccountRepository accountRepository;
 
     @SpyBean
     private PaymentStatusHistoryRepository historyRepository;
@@ -65,32 +78,11 @@ class NetworkResponseIntegrationTest {
     @Test
     void shouldPersistDelayedAcknowledgementAndUpdatePaymentStatus() {
 
-        String uetr = UUID.randomUUID().toString();
+        TestPayment payment =
+                createPendingPayment("INTEGRATION-TEST-");
 
-        TransactionLedger ledger = new TransactionLedger();
-        ledger.setUetr(uetr);
-        ledger.setTransactionId("INTEGRATION-TEST-001");
-        ledger.setAmount(new BigDecimal("2500.00"));
-        ledger.setCurrency("USD");
-        ledger.setStatus(
-                TransactionLedger.TransactionStatus.NETWORK_PENDING
-        );
-
-        ledgerRepository.saveAndFlush(ledger);
-
-        NetworkSubmission submission = new NetworkSubmission(
-                ledger,
-                "CROSS_BORDER_CORRESPONDENT",
-                "SIM-TEST-" + UUID.randomUUID(),
-                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
-                LocalDateTime.now().minusMinutes(5),
-                null,
-                "Original network request timed out"
-        );
-
-        submission = submissionRepository.saveAndFlush(submission);
-
-        Long submissionId = submission.getId();
+        String uetr = payment.uetr();
+        Long submissionId = payment.submissionId();
 
         NetworkResponse response =
                 networkResponseService.processDelayedResponse(
@@ -147,46 +139,22 @@ class NetworkResponseIntegrationTest {
         assertThat(originalSubmission.getRespondedAt()).isNull();
     }
 
-
     // --------------------------------------------------
-    // TEST 2: Delayed NACK
+    // TEST 2: Delayed NACK releases reserved funds
     // --------------------------------------------------
 
     @Test
-    void shouldPersistDelayedRejectionAndUpdatePaymentStatus() {
+    void shouldPersistDelayedRejectionAndReleaseReservedFunds() {
 
-        String uetr = UUID.randomUUID().toString();
-
-        TransactionLedger ledger = new TransactionLedger();
-        ledger.setUetr(uetr);
-        ledger.setTransactionId(
-                "INTEGRATION-NACK-" + UUID.randomUUID()
-        );
-        ledger.setAmount(new BigDecimal("1800.00"));
-        ledger.setCurrency("USD");
-        ledger.setStatus(
-                TransactionLedger.TransactionStatus.NETWORK_PENDING
-        );
-
-        ledgerRepository.saveAndFlush(ledger);
-
-        NetworkSubmission submission = new NetworkSubmission(
-                ledger,
-                "CROSS_BORDER_CORRESPONDENT",
-                "SIM-TEST-" + UUID.randomUUID(),
-                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
-                LocalDateTime.now().minusMinutes(5),
-                null,
-                "Original network request timed out"
-        );
-
-        submission = submissionRepository.saveAndFlush(submission);
-
-        Long submissionId = submission.getId();
+        TestPayment payment =
+                createPendingPayment(
+                        "INTEGRATION-NACK-",
+                        new BigDecimal("1800.00")
+                );
 
         NetworkResponse response =
                 networkResponseService.processDelayedResponse(
-                        submissionId,
+                        payment.submissionId(),
                         NetworkResponse.ResponseStatus.SIMULATED_NACK,
                         "Payment rejected by correspondent bank"
                 );
@@ -195,7 +163,7 @@ class NetworkResponseIntegrationTest {
 
         NetworkResponse storedResponse =
                 responseRepository
-                        .findByNetworkSubmission_Id(submissionId)
+                        .findByNetworkSubmission_Id(payment.submissionId())
                         .orElseThrow();
 
         assertThat(storedResponse.getStatus())
@@ -204,15 +172,35 @@ class NetworkResponseIntegrationTest {
                 );
 
         TransactionLedger updatedLedger =
-                ledgerRepository.findById(uetr).orElseThrow();
+                ledgerRepository.findById(payment.uetr()).orElseThrow();
 
         assertThat(updatedLedger.getStatus())
                 .isEqualTo(
                         TransactionLedger.TransactionStatus.REJECTED
                 );
 
+        assertThat(updatedLedger.getFundsReservationStatus())
+                .isEqualTo(
+                        TransactionLedger.FundsReservationStatus.RELEASED
+                );
+
+        CustomerAccount updatedAccount =
+                accountRepository.findById(payment.accountId())
+                        .orElseThrow();
+
+        assertThat(updatedAccount.getCurrentBalance())
+                .isEqualByComparingTo("10000.00");
+
+        assertThat(updatedAccount.getReservedBalance())
+                .isEqualByComparingTo("0.00");
+
+        assertThat(updatedAccount.getAvailableBalance())
+                .isEqualByComparingTo("10000.00");
+
         var history =
-                historyRepository.findByUetrOrderByChangedAtAsc(uetr);
+                historyRepository.findByUetrOrderByChangedAtAsc(
+                        payment.uetr()
+                );
 
         assertThat(history).hasSize(1);
 
@@ -227,7 +215,8 @@ class NetworkResponseIntegrationTest {
                 );
 
         NetworkSubmission originalSubmission =
-                submissionRepository.findById(submissionId).orElseThrow();
+                submissionRepository.findById(payment.submissionId())
+                        .orElseThrow();
 
         assertThat(originalSubmission.getStatus())
                 .isEqualTo(
@@ -242,40 +231,18 @@ class NetworkResponseIntegrationTest {
     // TEST 3: Sequential duplicate ACK
     // --------------------------------------------------
 
+
     @Test
     void shouldHandleDuplicateDelayedAcknowledgementWithoutDuplicateRecords() {
 
-        String uetr = UUID.randomUUID().toString();
+        TestPayment payment =
+                createPendingPayment("INTEGRATION-DUPLICATE-");
+
+        String uetr = payment.uetr();
+        Long submissionId = payment.submissionId();
 
         String responseMessage =
                 "Delayed ACK received from correspondent bank";
-
-        TransactionLedger ledger = new TransactionLedger();
-        ledger.setUetr(uetr);
-        ledger.setTransactionId(
-                "INTEGRATION-DUPLICATE-" + UUID.randomUUID()
-        );
-        ledger.setAmount(new BigDecimal("3000.00"));
-        ledger.setCurrency("USD");
-        ledger.setStatus(
-                TransactionLedger.TransactionStatus.NETWORK_PENDING
-        );
-
-        ledgerRepository.saveAndFlush(ledger);
-
-        NetworkSubmission submission = new NetworkSubmission(
-                ledger,
-                "CROSS_BORDER_CORRESPONDENT",
-                "SIM-TEST-" + UUID.randomUUID(),
-                NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT,
-                LocalDateTime.now().minusMinutes(5),
-                null,
-                "Original network request timed out"
-        );
-
-        submission = submissionRepository.saveAndFlush(submission);
-
-        Long submissionId = submission.getId();
 
         NetworkResponse firstResponse =
                 networkResponseService.processDelayedResponse(
@@ -416,6 +383,11 @@ class NetworkResponseIntegrationTest {
                             TransactionLedger.TransactionStatus.PROCESSING
                     );
 
+            assertThat(updatedLedger.getFundsReservationStatus())
+                    .isEqualTo(
+                            TransactionLedger.FundsReservationStatus.RESERVED
+                    );
+
         } finally {
             executor.shutdownNow();
         }
@@ -508,6 +480,10 @@ class NetworkResponseIntegrationTest {
                     ledgerRepository.findById(payment.uetr())
                             .orElseThrow();
 
+            CustomerAccount updatedAccount =
+                    accountRepository.findById(payment.accountId())
+                            .orElseThrow();
+
             if (storedResponse.getStatus()
                     == NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED) {
 
@@ -515,6 +491,14 @@ class NetworkResponseIntegrationTest {
                         .isEqualTo(
                                 TransactionLedger.TransactionStatus.PROCESSING
                         );
+
+                assertThat(updatedLedger.getFundsReservationStatus())
+                        .isEqualTo(
+                                TransactionLedger.FundsReservationStatus.RESERVED
+                        );
+
+                assertThat(updatedAccount.getReservedBalance())
+                        .isEqualByComparingTo("2500.00");
 
             } else {
 
@@ -527,6 +511,17 @@ class NetworkResponseIntegrationTest {
                         .isEqualTo(
                                 TransactionLedger.TransactionStatus.REJECTED
                         );
+
+                assertThat(updatedLedger.getFundsReservationStatus())
+                        .isEqualTo(
+                                TransactionLedger.FundsReservationStatus.RELEASED
+                        );
+
+                assertThat(updatedAccount.getCurrentBalance())
+                        .isEqualByComparingTo("10000.00");
+
+                assertThat(updatedAccount.getReservedBalance())
+                        .isEqualByComparingTo("0.00");
             }
 
             var history =
@@ -570,14 +565,12 @@ class NetworkResponseIntegrationTest {
 
         entityManager.clear();
 
-        // Network response must have been rolled back.
         assertThat(
                 responseRepository.findByNetworkSubmission_Id(
                         payment.submissionId()
                 )
         ).isEmpty();
 
-        // Payment status must remain unchanged.
         TransactionLedger ledger =
                 ledgerRepository.findById(payment.uetr()).orElseThrow();
 
@@ -586,7 +579,21 @@ class NetworkResponseIntegrationTest {
                         TransactionLedger.TransactionStatus.NETWORK_PENDING
                 );
 
-        // No history entry must have been persisted.
+        assertThat(ledger.getFundsReservationStatus())
+                .isEqualTo(
+                        TransactionLedger.FundsReservationStatus.RESERVED
+                );
+
+        CustomerAccount account =
+                accountRepository.findById(payment.accountId())
+                        .orElseThrow();
+
+        assertThat(account.getCurrentBalance())
+                .isEqualByComparingTo("10000.00");
+
+        assertThat(account.getReservedBalance())
+                .isEqualByComparingTo("2500.00");
+
         var history =
                 historyRepository.findByUetrOrderByChangedAtAsc(
                         payment.uetr()
@@ -597,25 +604,269 @@ class NetworkResponseIntegrationTest {
 
 
     // --------------------------------------------------
-    // HELPER: Create a payment waiting for network response
+    // TEST 7: Successful settlement debits reserved funds
     // --------------------------------------------------
 
-    private TestPayment createPendingPayment(String transactionPrefix) {
+    @Test
+    void shouldDebitReservedFundsWhenPaymentIsSettled() {
 
-        String uetr = UUID.randomUUID().toString();
+        TestPayment payment =
+                createPendingPayment("SETTLEMENT-SUCCESS-");
 
-        TransactionLedger ledger = new TransactionLedger();
-        ledger.setUetr(uetr);
-        ledger.setTransactionId(
-                transactionPrefix + UUID.randomUUID()
-        );
-        ledger.setAmount(new BigDecimal("2500.00"));
-        ledger.setCurrency("USD");
-        ledger.setStatus(
-                TransactionLedger.TransactionStatus.NETWORK_PENDING
+        // Move payment from NETWORK_PENDING to PROCESSING.
+        transactionStatusService.updateStatus(
+                payment.uetr(),
+                TransactionLedger.TransactionStatus.PROCESSING,
+                "Network ACK received"
         );
 
-        ledgerRepository.saveAndFlush(ledger);
+        // Settle the payment.
+        transactionStatusService.updateStatus(
+                payment.uetr(),
+                TransactionLedger.TransactionStatus.SETTLED,
+                "Payment settled successfully"
+        );
+
+        entityManager.clear();
+
+        TransactionLedger updatedLedger =
+                ledgerRepository.findById(payment.uetr()).orElseThrow();
+
+        CustomerAccount updatedAccount =
+                accountRepository.findById(payment.accountId())
+                        .orElseThrow();
+
+        assertThat(updatedLedger.getStatus())
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.SETTLED
+                );
+
+        assertThat(updatedLedger.getFundsReservationStatus())
+                .isEqualTo(
+                        TransactionLedger.FundsReservationStatus.DEBITED
+                );
+
+        assertThat(updatedAccount.getCurrentBalance())
+                .isEqualByComparingTo("7500.00");
+
+        assertThat(updatedAccount.getReservedBalance())
+                .isEqualByComparingTo("0.00");
+
+        assertThat(updatedAccount.getAvailableBalance())
+                .isEqualByComparingTo("7500.00");
+
+        var history =
+                historyRepository.findByUetrOrderByChangedAtAsc(
+                        payment.uetr()
+                );
+
+        assertThat(history).hasSize(2);
+
+        assertThat(history.get(0).getNewStatus())
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
+
+        assertThat(history.get(1).getPreviousStatus())
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
+
+        assertThat(history.get(1).getNewStatus())
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.SETTLED
+                );
+    }
+
+
+    // --------------------------------------------------
+    // TEST 8: Rollback settlement if history persistence fails
+    // --------------------------------------------------
+
+    @Test
+    void shouldRollbackSettlementWhenHistoryPersistenceFails() {
+
+        TestPayment payment =
+                createPendingPayment("SETTLEMENT-ROLLBACK-");
+
+        // First move payment to PROCESSING successfully.
+        transactionStatusService.updateStatus(
+                payment.uetr(),
+                TransactionLedger.TransactionStatus.PROCESSING,
+                "Network ACK received"
+        );
+
+        // Simulate failure while saving settlement history.
+        doThrow(new RuntimeException(
+                "Simulated settlement history failure"
+        ))
+                .when(historyRepository)
+                .save(any(PaymentStatusHistory.class));
+
+        assertThatThrownBy(() ->
+                transactionStatusService.updateStatus(
+                        payment.uetr(),
+                        TransactionLedger.TransactionStatus.SETTLED,
+                        "Payment settlement"
+                )
+        )
+                .isInstanceOf(RuntimeException.class)
+                .hasMessage("Simulated settlement history failure");
+
+        entityManager.clear();
+
+        TransactionLedger updatedLedger =
+                ledgerRepository.findById(payment.uetr()).orElseThrow();
+
+        assertThat(updatedLedger.getStatus())
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
+
+        assertThat(updatedLedger.getFundsReservationStatus())
+                .isEqualTo(
+                        TransactionLedger.FundsReservationStatus.RESERVED
+                );
+
+        CustomerAccount updatedAccount =
+                accountRepository.findById(payment.accountId())
+                        .orElseThrow();
+
+        assertThat(updatedAccount.getCurrentBalance())
+                .isEqualByComparingTo("10000.00");
+
+        assertThat(updatedAccount.getReservedBalance())
+                .isEqualByComparingTo("2500.00");
+
+        var history =
+                historyRepository.findByUetrOrderByChangedAtAsc(
+                        payment.uetr()
+                );
+
+        assertThat(history).hasSize(1);
+
+        assertThat(history.get(0).getNewStatus())
+                .isEqualTo(
+                        TransactionLedger.TransactionStatus.PROCESSING
+                );
+    }
+
+
+    // --------------------------------------------------
+    // TEST 9: Concurrent settlement cannot debit twice
+    // --------------------------------------------------
+
+    @Test
+    void shouldPreventDoubleDebitDuringConcurrentSettlement()
+            throws Exception {
+
+        TestPayment payment =
+                createPendingPayment("SETTLEMENT-CONCURRENT-");
+
+        // Prepare payment for settlement.
+        transactionStatusService.updateStatus(
+                payment.uetr(),
+                TransactionLedger.TransactionStatus.PROCESSING,
+                "Network ACK received"
+        );
+
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        ExecutorService executor =
+                Executors.newFixedThreadPool(2);
+
+        try {
+
+            var settlementRequest =
+                    (java.util.concurrent.Callable<String>) () -> {
+
+                        ready.countDown();
+                        start.await();
+
+                        try {
+
+                            transactionStatusService.updateStatus(
+                                    payment.uetr(),
+                                    TransactionLedger.TransactionStatus.SETTLED,
+                                    "Concurrent settlement request"
+                            );
+
+                            return "SUCCESS";
+
+                        } catch (IllegalStateException exception) {
+                            return "REJECTED";
+                        }
+                    };
+
+            Future<String> first =
+                    executor.submit(settlementRequest);
+
+            Future<String> second =
+                    executor.submit(settlementRequest);
+
+            assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+
+            start.countDown();
+
+            String firstResult =
+                    first.get(15, TimeUnit.SECONDS);
+
+            String secondResult =
+                    second.get(15, TimeUnit.SECONDS);
+
+            assertThat(List.of(firstResult, secondResult))
+                    .containsExactlyInAnyOrder(
+                            "SUCCESS",
+                            "REJECTED"
+                    );
+
+            entityManager.clear();
+
+            TransactionLedger updatedLedger =
+                    ledgerRepository.findById(payment.uetr())
+                            .orElseThrow();
+
+            CustomerAccount updatedAccount =
+                    accountRepository.findById(payment.accountId())
+                            .orElseThrow();
+
+            assertThat(updatedLedger.getStatus())
+                    .isEqualTo(
+                            TransactionLedger.TransactionStatus.SETTLED
+                    );
+
+            assertThat(updatedLedger.getFundsReservationStatus())
+                    .isEqualTo(
+                            TransactionLedger.FundsReservationStatus.DEBITED
+                    );
+
+            assertThat(updatedAccount.getCurrentBalance())
+                    .isEqualByComparingTo("7500.00");
+
+            assertThat(updatedAccount.getReservedBalance())
+                    .isEqualByComparingTo("0.00");
+
+            var history =
+                    historyRepository.findByUetrOrderByChangedAtAsc(
+                            payment.uetr()
+                    );
+
+            assertThat(history).hasSize(2);
+
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+
+    // --------------------------------------------------
+    // HELPER: Create a timed-out network submission
+    // --------------------------------------------------
+
+    private NetworkSubmission createTimedOutSubmission(
+            TransactionLedger ledger
+    ) {
 
         NetworkSubmission submission = new NetworkSubmission(
                 ledger,
@@ -627,10 +878,95 @@ class NetworkResponseIntegrationTest {
                 "Original network request timed out"
         );
 
-        submission = submissionRepository.saveAndFlush(submission);
-
-        return new TestPayment(uetr, submission.getId());
+        return submissionRepository.saveAndFlush(submission);
     }
 
-    private record TestPayment(String uetr, Long submissionId) {}
+
+    // --------------------------------------------------
+    // HELPER: Create a payment with genuinely reserved funds
+    // --------------------------------------------------
+
+    private TestPayment createPendingPayment(String transactionPrefix) {
+
+        return createPendingPayment(
+                transactionPrefix,
+                new BigDecimal("2500.00")
+        );
+    }
+
+    private TestPayment createPendingPayment(
+            String transactionPrefix,
+            BigDecimal senderDebit
+    ) {
+
+        String uetr = UUID.randomUUID().toString();
+
+        // Create a unique customer for this integration test.
+        String uniqueId = UUID.randomUUID().toString();
+
+        Customer customer = new Customer(
+                "Integration Test Customer",
+                "integration-" + uniqueId + "@example.com",
+                "test-password-hash",
+                "9000000000",
+                "IN",
+                "Pune",
+                CustomerRole.CUSTOMER
+        );
+
+        customer = customerRepository.saveAndFlush(customer);
+
+        // Create and fund the customer's account.
+        CustomerAccount account = new CustomerAccount(
+                "ACC" + uniqueId.replace("-", "").substring(0, 17),
+                customer,
+                "Integration Test Customer",
+                CustomerAccount.AccountType.SAVINGS,
+                "USD"
+        );
+
+        account.credit(new BigDecimal("10000.00"));
+
+        account = accountRepository.saveAndFlush(account);
+
+        // Reserve the sender debit before creating the pending payment.
+        account.reserve(senderDebit);
+
+        account = accountRepository.saveAndFlush(account);
+
+        // Create the payment ledger with its actual sender account.
+        TransactionLedger ledger = new TransactionLedger();
+
+        ledger.setUetr(uetr);
+        ledger.setTransactionId(
+                transactionPrefix + UUID.randomUUID()
+        );
+        ledger.setAmount(senderDebit);
+        ledger.setCurrency("USD");
+        ledger.setTotalSenderDebit(senderDebit);
+        ledger.setSenderAccount(account);
+        ledger.setStatus(
+                TransactionLedger.TransactionStatus.NETWORK_PENDING
+        );
+        ledger.markFundsReserved();
+
+        ledger = ledgerRepository.saveAndFlush(ledger);
+
+        NetworkSubmission submission =
+                createTimedOutSubmission(ledger);
+
+        return new TestPayment(
+                uetr,
+                submission.getId(),
+                account.getId()
+        );
+    }
+
+
+    private record TestPayment(
+            String uetr,
+            Long submissionId,
+            Long accountId
+    ) {
+    }
 }

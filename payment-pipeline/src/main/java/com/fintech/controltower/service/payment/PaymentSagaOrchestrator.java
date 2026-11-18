@@ -1,6 +1,7 @@
 
 package com.fintech.controltower.service.payment;
 
+import com.fintech.controltower.domain.entity.CustomerAccount;
 import com.fintech.controltower.domain.entity.IsoMessage;
 import com.fintech.controltower.domain.entity.NetworkSubmission;
 import com.fintech.controltower.domain.entity.PaymentStatusHistory;
@@ -8,6 +9,7 @@ import com.fintech.controltower.domain.entity.TransactionLedger;
 
 import com.fintech.controltower.domain.model.PaymentRequest;
 
+import com.fintech.controltower.domain.repository.CustomerAccountRepository;
 import com.fintech.controltower.domain.repository.IsoMessageRepository;
 import com.fintech.controltower.domain.repository.NetworkSubmissionRepository;
 import com.fintech.controltower.domain.repository.PaymentStatusHistoryRepository;
@@ -34,6 +36,8 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.RoundingMode;
+
 @Service
 public class PaymentSagaOrchestrator {
 
@@ -44,6 +48,7 @@ public class PaymentSagaOrchestrator {
     private final PaymentStatusHistoryRepository historyRepository;
     private final IsoMessageRepository isoMessageRepository;
     private final NetworkSubmissionRepository networkSubmissionRepository;
+    private final CustomerAccountRepository accountRepository;
 
     private final AmlScreeningService amlScreeningService;
     private final FinancialCalculationService financialCalculationService;
@@ -57,6 +62,7 @@ public class PaymentSagaOrchestrator {
             PaymentStatusHistoryRepository historyRepository,
             IsoMessageRepository isoMessageRepository,
             NetworkSubmissionRepository networkSubmissionRepository,
+            CustomerAccountRepository accountRepository,
             AmlScreeningService amlScreeningService,
             FinancialCalculationService financialCalculationService,
             NetworkAdapterRegistry networkAdapterRegistry,
@@ -67,6 +73,7 @@ public class PaymentSagaOrchestrator {
         this.historyRepository = historyRepository;
         this.isoMessageRepository = isoMessageRepository;
         this.networkSubmissionRepository = networkSubmissionRepository;
+        this.accountRepository = accountRepository;
         this.amlScreeningService = amlScreeningService;
         this.financialCalculationService = financialCalculationService;
         this.networkAdapterRegistry = networkAdapterRegistry;
@@ -87,7 +94,9 @@ public class PaymentSagaOrchestrator {
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public PaymentSagaResult executePaymentSaga(
             PaymentRequest request,
-            String uetr
+            String uetr,
+            Long customerId,
+            Long accountId
     ) {
 
         // 1. Calculate the financial instruction outside a DB transaction.
@@ -123,7 +132,7 @@ public class PaymentSagaOrchestrator {
             adapter = networkAdapterRegistry.getAdapter(routeType);
         }
 
-        // 3. Transaction 1: persist the initial payment atomically.
+        // 3. Transaction 1: persist initial payment and reserve funds.
         final PaymentNetworkAdapter selectedAdapter = adapter;
 
         transactionTemplate.executeWithoutResult(transactionStatus ->
@@ -131,7 +140,9 @@ public class PaymentSagaOrchestrator {
                         request,
                         uetr,
                         calculation,
-                        screeningResult
+                        screeningResult,
+                        customerId,
+                        accountId
                 )
         );
 
@@ -215,19 +226,54 @@ public class PaymentSagaOrchestrator {
 
     /*
      * Transaction 1:
-     * Create the ledger and its initial history together.
+     * Lock sender account, reserve funds, and create the ledger,
+     * initial history and outbox event together.
      */
     private void persistInitialPayment(
             PaymentRequest request,
             String uetr,
             PaymentCalculationResult calculation,
-            AmlScreeningService.AmlScreeningResult screeningResult
+            AmlScreeningService.AmlScreeningResult screeningResult,
+            Long customerId,
+            Long accountId
     ) {
+
+        CustomerAccount senderAccount = accountRepository
+                .findByIdAndCustomerIdForUpdate(accountId, customerId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Sender account not found for this customer"
+                        )
+                );
+
+        if (senderAccount.getStatus()
+                != CustomerAccount.AccountStatus.ACTIVE) {
+            throw new IllegalArgumentException(
+                    "Sender account is not active"
+            );
+        }
+
+        if (!senderAccount.getAccountNumber()
+                .equals(request.debtorAccountNumber())) {
+            throw new IllegalArgumentException(
+                    "Sender account does not match payment request"
+            );
+        }
+
+        if (!senderAccount.getCurrency()
+                .equalsIgnoreCase(calculation.sourceCurrency())) {
+            throw new IllegalArgumentException(
+                    "Sender account currency does not match payment currency"
+            );
+        }
 
         TransactionLedger ledger = new TransactionLedger();
 
         ledger.setUetr(uetr);
         ledger.setTransactionId(request.transactionId());
+
+        // Associate the actual sender account with the ledger.
+        ledger.setSenderAccount(senderAccount);
 
         // Sender details
         ledger.setDebtorName(request.debtorName());
@@ -270,6 +316,7 @@ public class PaymentSagaOrchestrator {
 
         if (screeningResult.hold()) {
 
+            // AML-held payments do not reserve funds.
             initialStatus =
                     TransactionLedger.TransactionStatus.SUSPENDED_AML_HOLD;
 
@@ -277,11 +324,17 @@ public class PaymentSagaOrchestrator {
 
         } else {
 
+            // Reserve principal plus applicable sender-side fees.
+            senderAccount.reserve(calculation.totalSenderDebit());
+
+            ledger.markFundsReserved();
+
             initialStatus =
                     TransactionLedger.TransactionStatus.ACCEPTED;
 
             historyReason =
-                    "Payment accepted after successful AML screening";
+                    "Payment accepted after successful AML screening "
+                            + "and sender funds reserved";
         }
 
         ledger.setStatus(initialStatus);
@@ -336,8 +389,8 @@ public class PaymentSagaOrchestrator {
 
     /*
      * Transaction 2:
-     * Persist the network submission, ISO message, payment status
-     * and status history as one atomic operation.
+     * Persist network submission, ISO message, payment status,
+     * status history and any required fund release atomically.
      */
     private void persistNetworkOutcome(
             String uetr,
@@ -427,6 +480,12 @@ public class PaymentSagaOrchestrator {
             );
         }
 
+        // A definitive NACK releases the reserved funds.
+        // ACK and timeout keep the reservation in place.
+        if ("SIMULATED_NACK".equals(result.status().name())) {
+            releaseReservedFunds(ledger);
+        }
+
         // Joins Transaction 2 because TransactionStatusService
         // uses Spring's default REQUIRED propagation.
         transactionStatusService.updateStatus(
@@ -434,6 +493,48 @@ public class PaymentSagaOrchestrator {
                 newStatus,
                 reason
         );
+    }
+
+    /*
+     * Release funds only when they are currently reserved.
+     * The reservation state prevents a second release.
+     */
+    private void releaseReservedFunds(TransactionLedger ledger) {
+
+        if (ledger.getFundsReservationStatus()
+                != TransactionLedger.FundsReservationStatus.RESERVED) {
+            return;
+        }
+
+        CustomerAccount associatedAccount = ledger.getSenderAccount();
+
+        if (associatedAccount == null) {
+            throw new IllegalStateException(
+                    "Reserved payment has no associated sender account"
+            );
+        }
+
+        Long customerId = associatedAccount.getCustomer().getId();
+
+        CustomerAccount senderAccount = accountRepository
+                .findByIdAndCustomerIdForUpdate(
+                        associatedAccount.getId(),
+                        customerId
+                )
+                .orElseThrow(() ->
+                        new IllegalStateException(
+                                "Sender account for reserved payment was not found"
+                        )
+                );
+
+        // The ledger column uses scale 5, while account operations
+        // accept scale 2. Remove trailing zeros without rounding.
+        senderAccount.release(
+                ledger.getTotalSenderDebit()
+                        .setScale(2, RoundingMode.UNNECESSARY)
+        );
+
+        ledger.markFundsReleased();
     }
 
     /*

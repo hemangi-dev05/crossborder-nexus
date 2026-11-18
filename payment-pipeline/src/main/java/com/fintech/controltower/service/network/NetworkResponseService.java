@@ -3,18 +3,21 @@ package com.fintech.controltower.service.network;
 
 import com.fintech.controltower.service.payment.TransactionStatusService;
 
+import com.fintech.controltower.domain.entity.CustomerAccount;
 import com.fintech.controltower.domain.entity.NetworkResponse;
 import com.fintech.controltower.domain.repository.NetworkResponseRepository;
 import com.fintech.controltower.domain.entity.NetworkSubmission;
 import com.fintech.controltower.domain.repository.NetworkSubmissionRepository;
 import com.fintech.controltower.domain.entity.TransactionLedger;
 import com.fintech.controltower.domain.repository.TransactionLedgerRepository;
+import com.fintech.controltower.domain.repository.CustomerAccountRepository;
 
 import jakarta.persistence.EntityNotFoundException;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.Objects;
 
@@ -24,21 +27,24 @@ public class NetworkResponseService {
     private final NetworkSubmissionRepository submissionRepository;
     private final NetworkResponseRepository responseRepository;
     private final TransactionLedgerRepository ledgerRepository;
+    private final CustomerAccountRepository accountRepository;
     private final TransactionStatusService statusService;
 
     public NetworkResponseService(
             NetworkSubmissionRepository submissionRepository,
             NetworkResponseRepository responseRepository,
             TransactionLedgerRepository ledgerRepository,
+            CustomerAccountRepository accountRepository,
             TransactionStatusService statusService
     ) {
         this.submissionRepository = submissionRepository;
         this.responseRepository = responseRepository;
         this.ledgerRepository = ledgerRepository;
+        this.accountRepository = accountRepository;
         this.statusService = statusService;
     }
 
-    // Process a delayed ACK or NACK atomically
+    // Process a delayed ACK or NACK atomically.
     @Transactional
     public NetworkResponse processDelayedResponse(
             Long submissionId,
@@ -46,7 +52,7 @@ public class NetworkResponseService {
             String responseMessage
     ) {
 
-        // 1. Validate request
+        // 1. Validate request.
         if (submissionId == null || submissionId <= 0) {
             throw new IllegalArgumentException(
                     "Valid network submission ID is required"
@@ -70,15 +76,16 @@ public class NetworkResponseService {
             );
         }
 
-        // 2. Find the original network submission
-        NetworkSubmission submission = submissionRepository.findById(submissionId)
-                .orElseThrow(() ->
-                        new EntityNotFoundException(
-                                "Network submission not found: " + submissionId
-                        )
-                );
+        // 2. Find the original network submission.
+        NetworkSubmission submission =
+                submissionRepository.findById(submissionId)
+                        .orElseThrow(() ->
+                                new EntityNotFoundException(
+                                        "Network submission not found: " + submissionId
+                                )
+                        );
 
-        // 3. Verify that the original submission timed out
+        // 3. Verify that the original submission timed out.
         if (submission.getStatus()
                 != NetworkSubmission.SubmissionStatus.SIMULATED_TIMEOUT) {
 
@@ -87,7 +94,7 @@ public class NetworkResponseService {
             );
         }
 
-        // 4. Lock the associated payment row
+        // 4. Lock the associated payment row.
         String uetr = submission.getTransactionLedger().getUetr();
 
         TransactionLedger ledger = ledgerRepository
@@ -98,7 +105,7 @@ public class NetworkResponseService {
                         )
                 );
 
-        // 5. Check whether a response was already recorded
+        // 5. Check whether a response was already recorded.
         var existingResponse =
                 responseRepository.findByNetworkSubmission_Id(submissionId);
 
@@ -114,7 +121,7 @@ public class NetworkResponseService {
                     );
 
             if (identicalResponse) {
-                // Idempotent retry: return the previously stored response
+                // Idempotent retry: return the previously stored response.
                 return existing;
             }
 
@@ -123,7 +130,7 @@ public class NetworkResponseService {
             );
         }
 
-        // 6. Payment must still be waiting for a network response
+        // 6. Payment must still be waiting for a network response.
         if (ledger.getStatus()
                 != TransactionLedger.TransactionStatus.NETWORK_PENDING) {
 
@@ -132,7 +139,57 @@ public class NetworkResponseService {
             );
         }
 
-        // 7. Persist the delayed network response
+        // 7. Determine the corresponding payment status.
+        boolean acknowledged =
+                responseStatus
+                        == NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED;
+
+        TransactionLedger.TransactionStatus newPaymentStatus =
+                acknowledged
+                        ? TransactionLedger.TransactionStatus.PROCESSING
+                        : TransactionLedger.TransactionStatus.REJECTED;
+
+        // 8. Release reserved funds when the delayed response is a NACK.
+        if (!acknowledged) {
+
+            if (ledger.getFundsReservationStatus()
+                    != TransactionLedger.FundsReservationStatus.RESERVED) {
+
+                throw new IllegalStateException(
+                        "Cannot process delayed NACK: payment funds are not reserved"
+                );
+            }
+
+            CustomerAccount associatedAccount = ledger.getSenderAccount();
+
+            if (associatedAccount == null) {
+                throw new IllegalStateException(
+                        "Sender account is missing for payment: " + uetr
+                );
+            }
+
+            CustomerAccount senderAccount =
+                    accountRepository.findByIdAndCustomerIdForUpdate(
+                                    associatedAccount.getId(),
+                                    associatedAccount.getCustomer().getId()
+                            )
+                            .orElseThrow(() ->
+                                    new EntityNotFoundException(
+                                            "Sender account not found for payment: " + uetr
+                                    )
+                            );
+
+            // Normalize harmless trailing decimal zeros.
+            // UNNECESSARY prevents silently rounding a real monetary amount.
+            var reservedAmount = ledger.getTotalSenderDebit()
+                    .setScale(2, RoundingMode.UNNECESSARY);
+
+            senderAccount.release(reservedAmount);
+
+            ledger.markFundsReleased();
+        }
+
+        // 9. Persist the delayed network response.
         NetworkResponse networkResponse = new NetworkResponse(
                 submission,
                 responseStatus,
@@ -143,27 +200,9 @@ public class NetworkResponseService {
         NetworkResponse savedResponse =
                 responseRepository.save(networkResponse);
 
-        // 8. Determine the corresponding payment status
-        TransactionLedger.TransactionStatus newPaymentStatus;
-
-        if (responseStatus
-                == NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED) {
-
-            newPaymentStatus =
-                    TransactionLedger.TransactionStatus.PROCESSING;
-
-        } else {
-
-            newPaymentStatus =
-                    TransactionLedger.TransactionStatus.REJECTED;
-        }
-
-        // 9. Update payment status and record status history
+        // 10. Update payment status and record status history.
         String reason = "Delayed network "
-                + (responseStatus
-                == NetworkResponse.ResponseStatus.SIMULATED_ACKNOWLEDGED
-                ? "ACK"
-                : "NACK")
+                + (acknowledged ? "ACK" : "NACK")
                 + " received for submission ID: " + submissionId;
 
         statusService.updateStatus(

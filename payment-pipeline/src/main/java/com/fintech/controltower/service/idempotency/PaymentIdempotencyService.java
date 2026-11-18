@@ -55,6 +55,7 @@ public class PaymentIdempotencyService {
 
     public PaymentResult processPayment(
             Long customerId,
+            Long accountId,
             String idempotencyKey,
             PaymentRequest request
     ) {
@@ -62,6 +63,12 @@ public class PaymentIdempotencyService {
         if (customerId == null) {
             throw new IllegalArgumentException(
                     "Customer ID is required"
+            );
+        }
+
+        if (accountId == null) {
+            throw new IllegalArgumentException(
+                    "Account ID is required"
             );
         }
 
@@ -163,7 +170,9 @@ public class PaymentIdempotencyService {
 
             sagaResult = paymentSagaOrchestrator.executePaymentSaga(
                     request,
-                    uetr
+                    uetr,
+                    customerId,
+                    accountId
             );
 
         } catch (AmlHoldException exception) {
